@@ -429,6 +429,38 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('incoming',after_receipt)
 
 
+    def test_receipt_actions_no_longer_require_batch_numbers(self):
+        self.act('opening',material_id=5,qty='2',price='11')
+        self.act('purchase',partner_id=3,material_id=5,qty='3',price='12')
+        self.act('receive',id=self.state()['purchases'][0]['id'])
+        self.assertEqual(self.stock(5),5000)
+        self.act('finished_receive',product_id=3,qty='10',processing_cost='0',received_on='2026-11-01')
+        self.assertEqual(self.stock(3),90000)
+        with self.erp.connection() as db:
+            keys=[r[0] for r in db.execute("SELECT batch FROM lots WHERE batch LIKE 'IN-%'")]
+        self.assertEqual(len(keys),3)
+        self.assertEqual(len(set(keys)),3)
+
+    def test_receipt_retry_does_not_duplicate_without_batch_field(self):
+        values=dict(product_id=3,qty='10',processing_cost='0',received_on='2026-11-01',request_id='same-receipt-form')
+        first=self.act('finished_receive',**values)
+        before=self.state()
+        second=self.act('finished_receive',**values)
+        self.assertEqual(first,second)
+        self.assertEqual(before['lots'],self.state()['lots'])
+        self.assertEqual(before['movements'],self.state()['movements'])
+        self.assertEqual(before['audit'],self.state()['audit'])
+        self.assertEqual(len(self.state()['finished_receipts']),1)
+        with self.assertRaises(BusinessError):
+            self.act('finished_receive',**{**values,'qty':'11'})
+        self.act('purchase',partner_id=3,material_id=5,qty='3',price='12')
+        purchase=self.state()['purchases'][0]
+        receipt=dict(id=purchase['id'],request_id='same-purchase-receipt')
+        self.act('receive',**receipt)
+        self.act('receive',**receipt)
+        self.assertEqual(self.stock(5),3000)
+
+
 class MonthlyBackupTests(unittest.TestCase):
     def test_rollover_catchup_no_overwrite_and_photos(self):
         from datetime import datetime, timezone

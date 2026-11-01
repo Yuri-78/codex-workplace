@@ -62,8 +62,9 @@ def run(mobile=False):
                 route('preparation')
                 assert '原料 / 商品缺口汇总' in page.locator('#page').inner_text()
                 open_action('finished_receive')
-                select('product_id',3);fill('qty','10');fill('batch','UI-FG-001');fill('processing_cost','30');fill('received_on','2026-10-31');save()
-                assert 'UI-FG-001' in page.locator('#page').inner_text()
+                select('product_id',3);fill('qty','10');fill('processing_cost','30');fill('received_on','2026-10-31');save()
+                assert '395.00' in page.locator('#page').inner_text()
+                assert page.locator('[name=batch]').count()==0
                 route('sales')
                 row=page.locator('#page tbody tr').filter(has_text=sale_number)
                 row.get_by_role('button',name='确认发货').click();fill('shipped_on','2026-10-31');save()
@@ -74,7 +75,9 @@ def run(mobile=False):
                 # Buy/resell trading cycle, without any work order.
                 route('purchases');open_action('purchase')
                 select('partner_id',3);select('material_id',5);fill('qty','20');fill('price','35');save()
-                page.get_by_role('button',name='收货入库').first.click();fill('batch','UI-TRADE-001');save()
+                page.get_by_role('button',name='收货入库').first.click()
+                assert page.locator('#modal [name=batch]').count()==0
+                save()
                 route('sales');open_action('sale')
                 select('partner_id',1);select('product_id',5);fill('qty','8');fill('price','68');save()
                 trade_number=page.locator('#page tbody tr').first.locator('.mono').inner_text()
@@ -160,10 +163,13 @@ def run(mobile=False):
                     assert db.execute('SELECT data FROM attachments LIMIT 1').fetchone()[0]==photo.read_bytes()
                 route('finance');page.get_by_role('button',name='收付款流水',exact=True).click()
                 assert '504.00' in page.locator('#page').inner_text()
-                route('inventory');page.get_by_role('button',name='批次追溯',exact=True).click()
-                page.locator('#page tbody tr').filter(has_text='UI-FG-001').get_by_role('button',name='追溯').click()
-                assert '成品用料' in page.locator('#modal').inner_text()
-                page.locator('#modal-close').click()
+                route('inventory')
+                assert page.get_by_role('heading',name='库存管理',exact=True).is_visible()
+                assert page.get_by_role('button',name='批次追溯',exact=True).count()==0
+                page.get_by_role('button',name='库存流水',exact=True).click()
+                assert '成品用料' in page.locator('#page').inner_text()
+                assert '销售出库' in page.locator('#page').inner_text()
+                assert '批次' not in page.locator('#page').inner_text()
                 # XSS stays text after rendering a user-supplied material name.
                 route('master');open_action('material')
                 fill('code','XSS-1');fill('name','<img src=x onerror=alert(1)>');select('kind','原材料');save()
@@ -176,7 +182,7 @@ def run(mobile=False):
                 page.locator('#login:not(.hidden)').wait_for()
                 assert errors==[],errors
                 browser.close()
-                print(('Mobile' if mobile else 'Desktop')+' Browser PASS: all pages, preparation, finished receipt, monthly statement, invoicing, photos, backup, trace; no JS errors.')
+                print(('Mobile' if mobile else 'Desktop')+' Browser PASS: all pages, preparation, finished receipt, monthly statement, invoicing, photos, backup, stock ledger; no JS errors.')
         finally:
             server.shutdown();server.server_close();thread.join()
 

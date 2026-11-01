@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS invoice_shipments(invoice_id INTEGER NOT NULL REFEREN
 CREATE TABLE IF NOT EXISTS finished_receipts(id INTEGER PRIMARY KEY,number TEXT UNIQUE NOT NULL,product_id INTEGER NOT NULL REFERENCES materials(id),qty INTEGER NOT NULL CHECK(qty>0),batch TEXT NOT NULL,received_on TEXT NOT NULL,material_cost INTEGER NOT NULL,processing_cost INTEGER NOT NULL,legacy_work_id INTEGER UNIQUE REFERENCES workorders(id),actor TEXT NOT NULL,created TEXT NOT NULL,note TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS statements(id INTEGER PRIMARY KEY,number TEXT UNIQUE NOT NULL,partner_id INTEGER NOT NULL REFERENCES partners(id),from_date TEXT NOT NULL,to_date TEXT NOT NULL,amount INTEGER NOT NULL,status TEXT NOT NULL DEFAULT '待确认',confirmed_on TEXT NOT NULL DEFAULT '',actor TEXT NOT NULL,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS statement_lines(id INTEGER PRIMARY KEY,statement_id INTEGER NOT NULL REFERENCES statements(id),shipment_id INTEGER UNIQUE NOT NULL REFERENCES shipments(id),product_id INTEGER NOT NULL REFERENCES materials(id),qty INTEGER NOT NULL,price INTEGER NOT NULL,amount INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS request_keys(token TEXT PRIMARY KEY,action TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id),payload_hash TEXT NOT NULL,reference TEXT NOT NULL,created TEXT NOT NULL);
+
 
 CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY,shipment_id INTEGER REFERENCES shipments(id),receipt_id INTEGER REFERENCES receipts(id),filename TEXT NOT NULL,mime TEXT NOT NULL,size INTEGER NOT NULL CHECK(size>0 AND size<=8388608),data BLOB NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL,CHECK((shipment_id IS NOT NULL AND receipt_id IS NULL) OR (shipment_id IS NULL AND receipt_id IS NOT NULL)));
 
@@ -116,9 +118,9 @@ class ERP:
         with self.connection() as check:
             version = check.execute('PRAGMA user_version').fetchone()[0]
             existing = check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
-        if version > 3:
+        if version > 4:
             raise BusinessError('数据库版本高于当前程序，请勿使用旧程序打开')
-        if existing and version < 3:
+        if existing and version < 4:
             from backup import backup
             folder = self.directory / 'backups'
             folder.mkdir(exist_ok=True, mode=0o700)
@@ -156,7 +158,7 @@ class ERP:
                 db.execute("ALTER TABLE payments ADD COLUMN paid_on TEXT NOT NULL DEFAULT ''")
             db.execute('CREATE INDEX IF NOT EXISTS payments_invoice ON payments(invoice_id)')
             db.execute("UPDATE invoices SET part_name=COALESCE((SELECT m.name FROM sales o JOIN materials m ON m.id=o.product_id WHERE o.id=invoices.sale_id),(SELECT m.name FROM purchases o JOIN materials m ON m.id=o.material_id WHERE o.id=invoices.purchase_id),'') WHERE part_name=''")
-            db.execute('PRAGMA user_version=3')
+            db.execute('PRAGMA user_version=4')
         os.chmod(self.dbpath, 0o600)
         from backup import MonthlyBackup
         self.monthly_backup = MonthlyBackup(self.dbpath, self.directory / 'backups' / 'monthly')
@@ -203,6 +205,11 @@ class ERP:
     @staticmethod
     def audit(db, actor, action, reference):
         db.execute('INSERT INTO audit(actor,action,reference,created) VALUES(?,?,?,?)', (actor,action,reference,now()))
+
+    @staticmethod
+    def stock_key(data):
+        # Preserve supplied keys from older clients; the current UI never asks for them.
+        return text(data,'batch') if data.get('batch') else 'IN-'+secrets.token_hex(12)
 
     def add_lot(self, db, mid, batch, qty, price, kind, ref, actor):
         if db.execute('SELECT 1 FROM lots WHERE material_id=? AND batch=?', (mid,batch)).fetchone():
@@ -304,6 +311,16 @@ class ERP:
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             ref = ''
+            request_id = data.get('request_id') if action in ('opening','receive','finished_receive') else None
+            payload_hash = None
+            if request_id:
+                request_id=text(data,'request_id')
+                payload_hash=hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+                previous=db.execute('SELECT * FROM request_keys WHERE token=?',(request_id,)).fetchone()
+                if previous:
+                    if previous['user_id']!=user['id'] or previous['action']!=action or previous['payload_hash']!=payload_hash:
+                        raise BusinessError('该请求标识已用于其他内容，请关闭表单后重新打开')
+                    return {'ok':True,'reference':previous['reference']}
             if action == 'material':
                 kind = text(data,'kind')
                 if kind not in ('原材料','成品','贸易商品'):
@@ -326,7 +343,7 @@ class ERP:
                 mid = ident(data,'material_id')
                 self.one(db,'materials',mid)
                 ref = self.number('OPEN')
-                self.add_lot(db,mid,text(data,'batch'),scaled(data.get('qty'),positive=True),scaled(data.get('price'),100),'期初入库',ref,actor)
+                self.add_lot(db,mid,self.stock_key(data),scaled(data.get('qty'),positive=True),scaled(data.get('price'),100),'期初入库',ref,actor)
             elif action in ('sale','purchase'):
                 is_sale = action == 'sale'
                 partner = self.one(db,'partners',ident(data,'partner_id'))
@@ -345,7 +362,7 @@ class ERP:
                 if r['status'] != '待收货':
                     raise BusinessError('该采购单已收货')
                 ref = r['number']
-                self.add_lot(db,r['material_id'],text(data,'batch'),r['qty'],r['price'],'采购入库',ref,actor)
+                self.add_lot(db,r['material_id'],self.stock_key(data),r['qty'],r['price'],'采购入库',ref,actor)
                 db.execute("UPDATE purchases SET status='已收货' WHERE id=?", (r['id'],))
                 day=due_date(data,'received_on') if data.get('received_on') else datetime.now(BUSINESS_TZ).date().isoformat()
                 db.execute('INSERT INTO receipts(number,purchase_id,received_on,actor,created) VALUES(?,?,?,?,?)',
@@ -356,7 +373,7 @@ class ERP:
                     raise BusinessError('请选择自产成品')
                 quantity=scaled(data.get('qty'),positive=True)
                 processing=scaled(data.get('processing_cost',0),100)
-                batch=text(data,'batch')
+                batch=self.stock_key(data)
                 day=due_date(data,'received_on')
                 legacy_id=ident(data,'legacy_work_id') if data.get('legacy_work_id') else None
                 pending=db.execute("SELECT w.* FROM workorders w LEFT JOIN finished_receipts f ON f.legacy_work_id=w.id WHERE w.product_id=? AND f.id IS NULL AND w.status!='已完工' AND (w.status='生产中' OR EXISTS(SELECT 1 FROM movements m WHERE m.reference=w.number AND m.kind='生产领料'))",(pid,)).fetchall()
@@ -555,6 +572,8 @@ class ERP:
                 ref=user['username']
             else:
                 raise BusinessError('未知操作')
+            if request_id:
+                db.execute('INSERT INTO request_keys VALUES(?,?,?,?,?,?)',(request_id,action,user['id'],payload_hash,ref,now()))
             self.audit(db,actor,action,ref)
         return {'ok':True,'reference':ref}
 
