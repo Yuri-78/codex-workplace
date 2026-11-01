@@ -186,6 +186,95 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(Path(self.temp.name,'missing.sqlite3').exists())
 
 
+    def test_invoices_independent_of_inventory_and_payments(self):
+        before=self.state()
+        self.act('invoice',number='INV-001',kind='销售发票',partner_id=1,issued_on='2026-11-01',amount='113',tax='13')
+        invoice=self.state()['invoices'][0]
+        self.assertEqual(invoice['amount'],11300)
+        self.assertEqual(invoice['tax'],1300)
+        self.assertIsNone(invoice['sale_id'])
+        self.assertEqual(before['lots'],self.state()['lots'])
+        self.assertEqual(before['payments'],self.state()['payments'])
+        self.assertEqual(before['sales'],self.state()['sales'])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.act('invoice',number='INV-001',kind='销售发票',partner_id=1,issued_on='2026-11-01',amount='1',tax='0')
+        for data in [dict(amount='10',tax='11'),dict(amount='10',tax='1',partner_id=3),dict(amount='10',tax='1',issued_on='bad')]:
+            values=dict(number='BAD',kind='销售发票',partner_id=1,issued_on='2026-11-01',amount='10',tax='0')
+            values.update(data)
+            with self.assertRaises(BusinessError):
+                self.act('invoice',**values)
+        self.assertEqual(len(self.state()['invoices']),1)
+
+    def test_linked_invoice_cap_and_void_preserves_history(self):
+        sale=self.state()['sales'][0]
+        total=sale['qty']*sale['price']//1000/100
+        data=dict(kind='销售发票',partner_id=sale['partner_id'],order_id=sale['id'],issued_on='2026-11-01',amount=str(total),tax='0')
+        self.act('invoice',number='LINK-1',**data)
+        with self.assertRaises(BusinessError):
+            self.act('invoice',number='LINK-2',**data)
+        original=self.state()['invoices'][0]
+        self.act('void_invoice',id=original['id'])
+        self.act('invoice',number='LINK-2',**data)
+        invoices=self.state()['invoices']
+        self.assertEqual(len(invoices),2)
+        self.assertEqual([r['status'] for r in invoices],['有效','作废'])
+        with self.assertRaises(BusinessError):
+            self.act('void_invoice',id=original['id'])
+        self.assertEqual(self.state()['payments'],[])
+
+    def test_purchase_invoice_order_and_permissions(self):
+        self.act('purchase',partner_id=3,material_id=1,qty='2',price='18')
+        order=self.state()['purchases'][0]
+        self.act('invoice',number='BUY-1',kind='采购发票',partner_id=3,order_id=order['id'],issued_on='2026-11-01',amount='36',tax='2')
+        self.assertEqual(self.state()['invoices'][0]['purchase_id'],order['id'])
+        with self.assertRaises(BusinessError):
+            self.act('invoice',number='BUY-2',kind='采购发票',partner_id=4,order_id=order['id'],issued_on='2026-11-01',amount='1',tax='0')
+        with self.erp.connection() as db:
+            user=dict(db.execute("SELECT id,username,name,role FROM users WHERE username='warehouse'").fetchone())
+        with self.assertRaises(BusinessError):
+            self.erp.action(user,'invoice',{})
+
+    def test_shipment_and_stock_commit_together(self):
+        sale=self.state()['sales'][0]
+        with self.assertRaises(BusinessError):
+            self.act('ship',id=sale['id'])
+        self.assertEqual(self.state()['shipments'],[])
+        self.act('sale',partner_id=1,product_id=3,qty='10',price='48',due='2026-12-01')
+        sale=self.state()['sales'][0]
+        self.act('ship',id=sale['id'],shipped_on='2026-11-01',receiver='张经理',address='测试收货地址',carrier='测试物流',tracking='TEST-001',note='测试出货')
+        shipment=self.state()['shipments'][0]
+        self.assertEqual(shipment['sale_id'],sale['id'])
+        self.assertEqual(shipment['tracking'],'TEST-001')
+        self.assertEqual(shipment['shipped_on'],'2026-11-01')
+        self.assertEqual(self.stock(3),70000)
+        with self.assertRaises(BusinessError):
+            self.act('ship',id=sale['id'])
+        self.assertEqual(len(self.state()['shipments']),1)
+
+    def test_legacy_upgrade_backup_and_shipment_backfill(self):
+        self.act('sale',partner_id=1,product_id=3,qty='10',price='48',due='2026-12-01')
+        sale=self.state()['sales'][0]
+        self.act('ship',id=sale['id'])
+        before=self.state()
+        with self.erp.connection() as db:
+            db.executescript('DROP TABLE shipments; DROP TABLE invoices; PRAGMA user_version=0;')
+        upgraded=ERP(self.temp.name)
+        after=upgraded.state(self.admin)
+        self.assertEqual(before['lots'],after['lots'])
+        self.assertEqual(before['movements'],after['movements'])
+        self.assertEqual(before['sales'],after['sales'])
+        self.assertEqual(len(after['shipments']),1)
+        self.assertIn('历史',after['shipments'][0]['note'])
+        backups=list(Path(self.temp.name,'backups').glob('*.sqlite3'))
+        self.assertEqual(len(backups),1)
+        with sqlite3.connect(backups[0]) as db:
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='shipments'").fetchone())
+            self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0],'ok')
+        ERP(self.temp.name)
+        self.assertEqual(len(list(Path(self.temp.name,'backups').glob('*.sqlite3'))),1)
+        self.assertEqual(len(upgraded.state(self.admin)['shipments']),1)
+
+
 class DesktopLauncherTests(unittest.TestCase):
     def test_demo_is_separate_and_handles_busy_port(self):
         from try_erp import prepare_demo
@@ -250,6 +339,27 @@ class HTTPTests(unittest.TestCase):
         post('/api/logout',{})
         with self.assertRaises(HTTPError):
             self.opener.open(self.url+'/api/state')
+
+    def test_admin_backup_download_and_authorization(self):
+        passwords=dict(line.split(': ',1) for line in Path(self.temp.name,'initial-accounts.txt').read_text().splitlines() if ': ' in line)
+        for username,expected in [('warehouse',403),('admin',200)]:
+            client=build_opener(HTTPCookieProcessor(CookieJar()))
+            def post(path,data):
+                return client.open(Request(self.url+path,data=json.dumps(data).encode(),headers={'Content-Type':'application/json'}))
+            post('/api/login',{'username':username,'password':passwords[username]})
+            if expected==403:
+                with self.assertRaises(HTTPError) as error:
+                    post('/api/backup',{})
+                self.assertEqual(error.exception.code,403)
+            else:
+                response=post('/api/backup',{})
+                self.assertIn('attachment',response.headers['Content-Disposition'])
+                filename=Path(self.temp.name)/'downloaded.sqlite3'
+                filename.write_bytes(response.read())
+                with sqlite3.connect(filename) as db:
+                    self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0],'ok')
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0],0)
+                    self.assertIsNotNone(db.execute("SELECT name FROM sqlite_master WHERE name='invoices'").fetchone())
 
 if __name__=='__main__':
     unittest.main()

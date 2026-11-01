@@ -1,5 +1,6 @@
 """Create a consistent SQLite backup while the ERP is running."""
 import argparse
+from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
@@ -15,14 +16,18 @@ def backup(source, destination):
     fd=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     os.close(fd)
     try:
-        with sqlite3.connect(source.as_uri()+'?mode=ro',uri=True) as src:
-            with sqlite3.connect(destination) as dst:
+        with closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as src:
+            with closing(sqlite3.connect(destination)) as dst:
                 src.backup(dst)
-                if dst.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
-                    raise ValueError('备份完整性检查失败')
-                # Existing sessions should not be resurrected when restoring a backup.
+                # Session removal must be checkpointed into the delivered single file.
                 dst.execute('DELETE FROM sessions')
                 dst.commit()
+                dst.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                mode=dst.execute('PRAGMA journal_mode=DELETE').fetchone()[0]
+                if mode.lower()!='delete':
+                    raise ValueError('备份未能转换为独立数据库文件')
+                if dst.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
+                    raise ValueError('备份完整性检查失败')
     except Exception:
         destination.unlink(missing_ok=True)
         raise

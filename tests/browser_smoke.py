@@ -33,7 +33,7 @@ def run(mobile=False):
                 page.get_by_role('button',name='进入工作台').click()
                 page.locator('#shell:not(.hidden)').wait_for()
                 page.screenshot(path='/tmp/erp-dashboard.png',full_page=True)
-                for route in ['sales','production','purchases','inventory','finance','master','audit','dashboard']:
+                for route in ['sales','shipments','invoices','production','purchases','inventory','finance','master','audit','dashboard']:
                     page.locator(f'#nav a[href="#{route}"]').click()
                     page.locator('#page h1').wait_for()
                     if mobile:
@@ -75,7 +75,33 @@ def run(mobile=False):
                 route('sales');open_action('sale')
                 select('partner_id',1);select('product_id',5);fill('qty','8');fill('price','68');save()
                 trade_number=page.locator('#page tbody tr').first.locator('.mono').inner_text()
-                page.locator('#page tbody tr').first.get_by_role('button',name='确认发货').click();save()
+                route('shipments');open_action('ship')
+                key=page.locator('#modal [name=id] option').filter(has_text=trade_number).get_attribute('value')
+                select('id',key);fill('receiver','验收收货人');fill('carrier','测试物流');fill('tracking','SHIP-TEST-001');save()
+                assert 'SHIP-TEST-001' in page.locator('#page').inner_text()
+                assert trade_number in page.locator('#page').inner_text()
+                route('invoices');open_action('invoice')
+                fill('number','INV-BROWSER-001');select('partner_id',1)
+                key=page.locator('#modal [name=order_id] option').filter(has_text=trade_number).get_attribute('value')
+                select('order_id',key);fill('tax','44');save()
+                assert 'INV-BROWSER-001' in page.locator('#page').inner_text()
+                assert '500.00' in page.locator('#page').inner_text()
+                page.screenshot(path='/tmp/erp-invoices.png',full_page=True)
+                page.get_by_role('button',name='作废记录',exact=True).click();save()
+                assert '作废' in page.locator('#page tbody').inner_text()
+                open_action('invoice');select('kind','采购发票');select('partner_id',3)
+                fill('number','BUY-BROWSER-001');fill('amount','100');fill('tax','0');save()
+                assert '独立登记' in page.locator('#page tbody').inner_text()
+                with page.expect_download() as event:
+                    page.locator('#backup').click()
+                downloaded=Path(directory)/'browser-backup.sqlite3'
+                event.value.save_as(downloaded)
+                import sqlite3
+                with sqlite3.connect(downloaded) as db:
+                    assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+                    assert db.execute('SELECT COUNT(*) FROM invoices').fetchone()[0]==2
+                    assert db.execute('SELECT COUNT(*) FROM shipments').fetchone()[0]==2
+                    assert db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]==0
                 route('finance');open_action('payment')
                 select('reference',trade_number);fill('amount','544');fill('note','浏览器验收');save()
                 page.get_by_role('button',name='收付款流水',exact=True).click()

@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 import threading
+import tempfile
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
@@ -32,6 +33,12 @@ CREATE TABLE IF NOT EXISTS lots(id INTEGER PRIMARY KEY,material_id INTEGER NOT N
 CREATE TABLE IF NOT EXISTS movements(id INTEGER PRIMARY KEY,material_id INTEGER NOT NULL REFERENCES materials(id),batch TEXT NOT NULL,qty INTEGER NOT NULL,amount INTEGER NOT NULL,kind TEXT NOT NULL,reference TEXT NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,actor TEXT NOT NULL,action TEXT NOT NULL,reference TEXT NOT NULL,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('收款','付款')),reference TEXT NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),note TEXT NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS shipments(id INTEGER PRIMARY KEY,number TEXT UNIQUE NOT NULL,sale_id INTEGER UNIQUE NOT NULL REFERENCES sales(id),shipped_on TEXT NOT NULL,receiver TEXT NOT NULL,address TEXT NOT NULL,carrier TEXT NOT NULL,tracking TEXT NOT NULL,note TEXT NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY,number TEXT UNIQUE NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('销售发票','采购发票')),partner_id INTEGER NOT NULL REFERENCES partners(id),sale_id INTEGER REFERENCES sales(id),purchase_id INTEGER REFERENCES purchases(id),issued_on TEXT NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),tax INTEGER NOT NULL CHECK(tax>=0 AND tax<=amount),status TEXT NOT NULL DEFAULT '有效' CHECK(status IN ('有效','作废')),note TEXT NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL,CHECK((kind='销售发票' AND purchase_id IS NULL) OR (kind='采购发票' AND sale_id IS NULL)));
+CREATE INDEX IF NOT EXISTS invoices_sale ON invoices(sale_id,status);
+CREATE INDEX IF NOT EXISTS invoices_purchase ON invoices(purchase_id,status);
+CREATE INDEX IF NOT EXISTS movements_reference ON movements(reference);
+
 '''
 
 class BusinessError(Exception):
@@ -76,8 +83,8 @@ def ident(data, name):
         raise BusinessError(f'请选择有效的 {name}')
 
 
-def due_date(data):
-    value = text(data, 'due')
+def due_date(data, key='due'):
+    value = text(data, key)
     try:
         return date.fromisoformat(value).isoformat()
     except ValueError:
@@ -93,6 +100,18 @@ class ERP:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.dbpath = self.directory / 'erp.sqlite3'
+        # Older account books get a consistent local backup before this schema upgrade.
+        # This is upgrade protection, not an off-device disaster-recovery backup.
+        with self.connection() as check:
+            version = check.execute('PRAGMA user_version').fetchone()[0]
+            existing = check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+        if version > 1:
+            raise BusinessError('数据库版本高于当前程序，请勿使用旧程序打开')
+        if existing and version < 1:
+            from backup import backup
+            folder = self.directory / 'backups'
+            folder.mkdir(exist_ok=True, mode=0o700)
+            backup(self.dbpath, folder / f'pre-upgrade-{secrets.token_hex(8)}.sqlite3')
         with self.connection() as db:
             db.executescript(SCHEMA)
             db.execute('PRAGMA journal_mode=WAL')
@@ -109,13 +128,25 @@ class ERP:
                     f.write('首次登录账号（请在登录后更改密码）\n' + '\n'.join(credentials) + '\n')
             if demo and not db.execute('SELECT 1 FROM materials').fetchone():
                 self.seed(db)
+            self.backfill_shipments(db)
+            db.execute('PRAGMA user_version=1')
         os.chmod(self.dbpath, 0o600)
+
+    def backfill_shipments(self, db):
+        # Historical sales already deducted stock. Create documentary records only.
+        sales = db.execute("SELECT s.* FROM sales s LEFT JOIN shipments h ON h.sale_id=s.id WHERE s.status='已发货' AND h.id IS NULL").fetchall()
+        for sale in sales:
+            movement = db.execute("SELECT MIN(created) FROM movements WHERE reference=? AND kind='销售出库'", (sale['number'],)).fetchone()[0]
+            shipped_on = datetime.fromisoformat(movement).astimezone(BUSINESS_TZ).date().isoformat() if movement else ''
+            db.execute('INSERT INTO shipments(number,sale_id,shipped_on,receiver,address,carrier,tracking,note,actor,created) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (self.number('SH'),sale['id'],shipped_on,'','','','','历史出货记录补录，物流资料未知','历史导入',movement or now()))
 
     @contextmanager
     def connection(self):
         db = sqlite3.connect(self.dbpath, timeout=15)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA foreign_keys=ON')
+        db.execute('PRAGMA synchronous=FULL')
         try:
             with db:
                 yield db
@@ -128,7 +159,7 @@ class ERP:
 
     @staticmethod
     def one(db, table, key):
-        allowed = {'materials','partners','sales','purchases','workorders','users'}
+        allowed = {'materials','partners','sales','purchases','workorders','users','invoices'}
         if table not in allowed:
             raise BusinessError('无效的数据表')
         r = db.execute(f'SELECT * FROM {table} WHERE id=?', (key,)).fetchone()
@@ -203,7 +234,7 @@ class ERP:
 
     def state(self, user):
         with self.connection() as db:
-            result = {t:self.rows(db,f'SELECT * FROM {t} ORDER BY id DESC') for t in ('materials','partners','sales','purchases','workorders','lots','movements','audit','payments')}
+            result = {t:self.rows(db,f'SELECT * FROM {t} ORDER BY id DESC') for t in ('materials','partners','sales','purchases','workorders','lots','movements','audit','payments','shipments','invoices')}
             result['bom'] = self.rows(db,'SELECT * FROM bom ORDER BY product_id,material_id')
             result['requirements'] = self.rows(db,'SELECT * FROM requirements')
             result['user'] = user
@@ -211,7 +242,7 @@ class ERP:
             return result
 
     def action(self, user, action, data):
-        permissions = {'业务':{'partner','sale','purchase','payment'},'仓库':{'opening','receive','ship'},'生产':{'work','issue','advance','complete'}}
+        permissions = {'业务':{'partner','sale','purchase','payment','invoice','void_invoice'},'仓库':{'opening','receive','ship'},'生产':{'work','issue','advance','complete'}}
         if action != 'password' and user['role'] != '管理' and action not in permissions.get(user['role'],set()):
             raise BusinessError('当前账号没有此操作权限')
         actor = user['name']
@@ -312,8 +343,49 @@ class ERP:
                 if r['status'] != '待发货':
                     raise BusinessError('该订单已发货')
                 ref = r['number']
+                shipped_on = due_date(data, 'shipped_on') if data.get('shipped_on') else datetime.now(BUSINESS_TZ).date().isoformat()
+                details = [str(data.get(key,'')).strip() for key in ('receiver','address','carrier','tracking','note')]
+                if any(len(value)>160 for value in details):
+                    raise BusinessError('出货信息每项最多 160 个字符')
                 self.consume(db,r['product_id'],r['qty'],'销售出库',ref,actor)
                 db.execute("UPDATE sales SET status='已发货' WHERE id=?",(r['id'],))
+                shipment_number = self.number('SH')
+                db.execute('INSERT INTO shipments(number,sale_id,shipped_on,receiver,address,carrier,tracking,note,actor,created) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                           (shipment_number,r['id'],shipped_on,*details,actor,now()))
+            elif action == 'invoice':
+                kind = text(data,'kind')
+                if kind not in ('销售发票','采购发票'):
+                    raise BusinessError('发票类型无效')
+                partner = self.one(db,'partners',ident(data,'partner_id'))
+                if partner['kind'] != ('客户' if kind=='销售发票' else '供应商'):
+                    raise BusinessError('发票类型与往来单位不匹配')
+                gross = scaled(data.get('amount'),100,positive=True)
+                tax = scaled(data.get('tax',0),100)
+                if tax > gross:
+                    raise BusinessError('税额不能超过价税合计')
+                sale_id = purchase_id = None
+                order_id = data.get('order_id')
+                if order_id:
+                    order = self.one(db,'sales' if kind=='销售发票' else 'purchases',ident(data,'order_id'))
+                    if order['partner_id'] != partner['id']:
+                        raise BusinessError('关联订单与往来单位不匹配')
+                    column = 'sale_id' if kind=='销售发票' else 'purchase_id'
+                    invoiced = db.execute(f"SELECT COALESCE(SUM(amount),0) FROM invoices WHERE {column}=? AND status='有效'",(order['id'],)).fetchone()[0]
+                    if gross+invoiced > cost(order['qty'],order['price']):
+                        raise BusinessError('累计有效发票金额超过订单金额')
+                    if kind=='销售发票':
+                        sale_id=order['id']
+                    else:
+                        purchase_id=order['id']
+                ref=text(data,'number')
+                db.execute('INSERT INTO invoices(number,kind,partner_id,sale_id,purchase_id,issued_on,amount,tax,note,actor,created) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                           (ref,kind,partner['id'],sale_id,purchase_id,due_date(data,'issued_on'),gross,tax,str(data.get('note',''))[:160],actor,now()))
+            elif action == 'void_invoice':
+                invoice=self.one(db,'invoices',ident(data,'id'))
+                if invoice['status']!='有效':
+                    raise BusinessError('该记录已经作废')
+                db.execute("UPDATE invoices SET status='作废' WHERE id=?",(invoice['id'],))
+                ref=invoice['number']
             elif action == 'payment':
                 kind, ref = text(data,'kind'),text(data,'reference')
                 if kind not in ('收款','付款'):
@@ -351,7 +423,7 @@ class Handler(BaseHTTPRequestHandler):
         # Never log request bodies, cookies or login credentials.
         super().log_message(fmt,*args)
 
-    def respond(self, status, body, content_type='application/json; charset=utf-8', cookie=None):
+    def respond(self, status, body, content_type='application/json; charset=utf-8', cookie=None, attachment=None):
         raw = json.dumps(body,ensure_ascii=False).encode() if content_type.startswith('application/json') else body
         self.send_response(status)
         self.send_header('Content-Type',content_type)
@@ -360,6 +432,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('X-Frame-Options','DENY')
         self.send_header('Content-Security-Policy',"default-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        if attachment:
+            self.send_header('Content-Disposition',f'attachment; filename="{attachment}"')
         if cookie:
             self.send_header('Set-Cookie',cookie)
         self.end_headers()
@@ -428,6 +502,16 @@ class Handler(BaseHTTPRequestHandler):
             user = self.server.erp.user(self.token())
             if not user:
                 return self.respond(401,{'error':'请先登录'})
+            if path == '/api/backup':
+                if user['role'] != '管理':
+                    return self.respond(403,{'error':'只有管理员可以下载备份'})
+                from backup import backup
+                with tempfile.TemporaryDirectory() as folder:
+                    destination = backup(self.server.erp.dbpath, Path(folder)/'erp-backup.sqlite3')
+                    raw = destination.read_bytes()
+                with self.server.erp.connection() as db:
+                    self.server.erp.audit(db,user['name'],'backup','数据库备份下载')
+                return self.respond(200,raw,'application/octet-stream',attachment='erp-backup-'+datetime.now(BUSINESS_TZ).strftime('%Y%m%d-%H%M%S')+'.sqlite3')
             if path == '/api/logout':
                 with self.server.erp.connection() as db:
                     db.execute('DELETE FROM sessions WHERE token=?',(self.token(),))
