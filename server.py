@@ -5,7 +5,7 @@ import base64
 import binascii
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_CEILING
 import hashlib
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +43,10 @@ CREATE INDEX IF NOT EXISTS invoices_purchase ON invoices(purchase_id,status);
 CREATE INDEX IF NOT EXISTS movements_reference ON movements(reference);
 CREATE TABLE IF NOT EXISTS receipts(id INTEGER PRIMARY KEY,number TEXT UNIQUE NOT NULL,purchase_id INTEGER UNIQUE NOT NULL REFERENCES purchases(id),received_on TEXT NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL,note TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS invoice_shipments(invoice_id INTEGER NOT NULL REFERENCES invoices(id),shipment_id INTEGER NOT NULL REFERENCES shipments(id),PRIMARY KEY(invoice_id,shipment_id));
+CREATE TABLE IF NOT EXISTS finished_receipts(id INTEGER PRIMARY KEY,number TEXT UNIQUE NOT NULL,product_id INTEGER NOT NULL REFERENCES materials(id),qty INTEGER NOT NULL CHECK(qty>0),batch TEXT NOT NULL,received_on TEXT NOT NULL,material_cost INTEGER NOT NULL,processing_cost INTEGER NOT NULL,legacy_work_id INTEGER UNIQUE REFERENCES workorders(id),actor TEXT NOT NULL,created TEXT NOT NULL,note TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS statements(id INTEGER PRIMARY KEY,number TEXT UNIQUE NOT NULL,partner_id INTEGER NOT NULL REFERENCES partners(id),from_date TEXT NOT NULL,to_date TEXT NOT NULL,amount INTEGER NOT NULL,status TEXT NOT NULL DEFAULT '待确认',confirmed_on TEXT NOT NULL DEFAULT '',actor TEXT NOT NULL,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS statement_lines(id INTEGER PRIMARY KEY,statement_id INTEGER NOT NULL REFERENCES statements(id),shipment_id INTEGER UNIQUE NOT NULL REFERENCES shipments(id),product_id INTEGER NOT NULL REFERENCES materials(id),qty INTEGER NOT NULL,price INTEGER NOT NULL,amount INTEGER NOT NULL);
+
 CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY,shipment_id INTEGER REFERENCES shipments(id),receipt_id INTEGER REFERENCES receipts(id),filename TEXT NOT NULL,mime TEXT NOT NULL,size INTEGER NOT NULL CHECK(size>0 AND size<=8388608),data BLOB NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL,CHECK((shipment_id IS NOT NULL AND receipt_id IS NULL) OR (shipment_id IS NULL AND receipt_id IS NOT NULL)));
 
 
@@ -112,9 +116,9 @@ class ERP:
         with self.connection() as check:
             version = check.execute('PRAGMA user_version').fetchone()[0]
             existing = check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
-        if version > 2:
+        if version > 3:
             raise BusinessError('数据库版本高于当前程序，请勿使用旧程序打开')
-        if existing and version < 2:
+        if existing and version < 3:
             from backup import backup
             folder = self.directory / 'backups'
             folder.mkdir(exist_ok=True, mode=0o700)
@@ -124,7 +128,7 @@ class ERP:
             db.execute('PRAGMA journal_mode=WAL')
             if not db.execute('SELECT 1 FROM users').fetchone():
                 credentials = []
-                for username, name, role in [('admin','管理员','管理'),('sales','销售与采购','业务'),('warehouse','仓库管理员','仓库'),('production','生产负责人','生产')]:
+                for username, name, role in [('admin','管理员','管理'),('sales','销售与采购','业务'),('warehouse','仓库管理员','仓库'),('production','备料与成品','备料')]:
                     password = secrets.token_urlsafe(12)
                     salt = secrets.token_hex(16)
                     db.execute('INSERT INTO users(username,name,role,salt,password) VALUES(?,?,?,?,?)', (username,name,role,salt,password_hash(password,salt)))
@@ -152,7 +156,7 @@ class ERP:
                 db.execute("ALTER TABLE payments ADD COLUMN paid_on TEXT NOT NULL DEFAULT ''")
             db.execute('CREATE INDEX IF NOT EXISTS payments_invoice ON payments(invoice_id)')
             db.execute("UPDATE invoices SET part_name=COALESCE((SELECT m.name FROM sales o JOIN materials m ON m.id=o.product_id WHERE o.id=invoices.sale_id),(SELECT m.name FROM purchases o JOIN materials m ON m.id=o.material_id WHERE o.id=invoices.purchase_id),'') WHERE part_name=''")
-            db.execute('PRAGMA user_version=2')
+            db.execute('PRAGMA user_version=3')
         os.chmod(self.dbpath, 0o600)
         from backup import MonthlyBackup
         self.monthly_backup = MonthlyBackup(self.dbpath, self.directory / 'backups' / 'monthly')
@@ -184,7 +188,7 @@ class ERP:
 
     @staticmethod
     def one(db, table, key):
-        allowed = {'materials','partners','sales','purchases','workorders','users','invoices','shipments','receipts'}
+        allowed = {'materials','partners','sales','purchases','workorders','users','invoices','shipments','receipts','statements'}
         if table not in allowed:
             raise BusinessError('无效的数据表')
         r = db.execute(f'SELECT * FROM {table} WHERE id=?', (key,)).fetchone()
@@ -259,11 +263,14 @@ class ERP:
 
     def state(self, user):
         with self.connection() as db:
-            result = {t:self.rows(db,f'SELECT * FROM {t} ORDER BY id DESC') for t in ('materials','partners','sales','purchases','workorders','lots','movements','audit','payments','shipments','invoices','receipts')}
+            result = {t:self.rows(db,f'SELECT * FROM {t} ORDER BY id DESC') for t in ('materials','partners','sales','purchases','lots','movements','audit','payments','shipments','invoices','receipts','finished_receipts','statements','statement_lines')}
             result['attachments'] = self.rows(db,'SELECT id,shipment_id,receipt_id,filename,mime,size,actor,created FROM attachments ORDER BY id DESC')
             result['invoice_shipments'] = self.rows(db,'SELECT * FROM invoice_shipments')
             result['bom'] = self.rows(db,'SELECT * FROM bom ORDER BY product_id,material_id')
-            result['requirements'] = self.rows(db,'SELECT * FROM requirements')
+            result['finished_receipts'] = self.rows(db,'SELECT f.*,w.number AS legacy_reference FROM finished_receipts f LEFT JOIN workorders w ON w.id=f.legacy_work_id ORDER BY f.id DESC')
+            result['legacy_materials'] = self.rows(db,"SELECT w.id,w.number,w.product_id,w.qty,w.material_cost FROM workorders w LEFT JOIN finished_receipts f ON f.legacy_work_id=w.id WHERE f.id IS NULL AND w.status!='已完工' AND (w.status='生产中' OR EXISTS(SELECT 1 FROM movements m WHERE m.reference=w.number AND m.kind='生产领料'))")
+            from planning import material_plan
+            result['preparation'] = material_plan(result['materials'],result['sales'],result['lots'],result['bom'],result['legacy_materials'])
             result['invoices'] = self.rows(db, 'SELECT i.*, COALESCE(SUM(p.amount),0) AS settled_amount, MAX(p.paid_on) AS last_paid_on FROM invoices i LEFT JOIN payments p ON p.invoice_id=i.id GROUP BY i.id ORDER BY i.id DESC')
             if user['role']=='管理':
                 result['monthly_backup'] = self.monthly_backup.status()
@@ -288,9 +295,11 @@ class ERP:
         return ids,', '.join(parts)
 
     def action(self, user, action, data):
-        permissions = {'业务':{'partner','sale','purchase','payment','invoice','void_invoice','invoice_payment','invoice_details'},'仓库':{'opening','receive','ship','attachment'},'生产':{'work','issue','advance','complete'}}
+        permissions = {'业务':{'partner','sale','purchase','payment','invoice','void_invoice','invoice_payment','invoice_details','statement_create','statement_confirm'},'仓库':{'opening','receive','ship','attachment','finished_receive'},'生产':{'finished_receive'},'备料':{'finished_receive'}}
         if action != 'password' and user['role'] != '管理' and action not in permissions.get(user['role'],set()):
             raise BusinessError('当前账号没有此操作权限')
+        if action in ('work','issue','advance','complete'):
+            raise BusinessError('生产工单和工序操作已停用，请使用备料看板及成品入库')
         actor = user['name']
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -310,7 +319,7 @@ class ERP:
             elif action == 'bom':
                 pid, mid = ident(data,'product_id'),ident(data,'material_id')
                 if self.one(db,'materials',pid)['kind'] != '成品' or self.one(db,'materials',mid)['kind'] != '原材料':
-                    raise BusinessError('BOM 必须由成品和原材料组成')
+                    raise BusinessError('物料用量表必须由成品和原材料组成')
                 db.execute('INSERT INTO bom VALUES(?,?,?) ON CONFLICT(product_id,material_id) DO UPDATE SET qty=excluded.qty', (pid,mid,scaled(data.get('qty'),positive=True)))
                 ref = f'{pid}/{mid}'
             elif action == 'opening':
@@ -341,52 +350,61 @@ class ERP:
                 day=due_date(data,'received_on') if data.get('received_on') else datetime.now(BUSINESS_TZ).date().isoformat()
                 db.execute('INSERT INTO receipts(number,purchase_id,received_on,actor,created) VALUES(?,?,?,?,?)',
                            (self.number('RC'),r['id'],day,actor,now()))
-            elif action == 'work':
-                pid, qty = ident(data,'product_id'),scaled(data.get('qty'),positive=True)
-                if self.one(db,'materials',pid)['kind'] != '成品':
-                    raise BusinessError('请选择成品')
-                sid = int(data.get('sale_id') or 0) or None
-                if sid:
-                    sale = self.one(db,'sales',sid)
-                    if sale['product_id'] != pid or sale['status'] != '待发货':
-                        raise BusinessError('销售订单与成品不匹配或已发货')
-                    planned = db.execute('SELECT COALESCE(SUM(qty),0) FROM workorders WHERE sale_id=?',(sid,)).fetchone()[0]
-                    if planned+qty > sale['qty']:
-                        raise BusinessError('关联工单的总数量不能超过订单数量；备货请创建无关联工单')
-                bom = db.execute('SELECT * FROM bom WHERE product_id=?',(pid,)).fetchall()
-                if not bom:
-                    raise BusinessError('请先维护该成品的 BOM')
-                steps = [s.strip() for s in str(data.get('steps','模切,缝纫,背胶,检验')).split(',') if s.strip()]
-                if not steps or len(steps)>12 or any(len(s)>30 for s in steps):
-                    raise BusinessError('工序需为 1–12 项，每项不超过 30 字，使用英文逗号分隔')
-                ref = self.number('MO')
-                cur = db.execute('INSERT INTO workorders(number,sale_id,product_id,qty,due,steps,created) VALUES(?,?,?,?,?,?,?)', (ref,sid,pid,qty,due_date(data),json.dumps(steps,ensure_ascii=False),now()))
-                for line in bom:
-                    required = int((Decimal(qty)*line['qty']/1000).to_integral_value(rounding='ROUND_CEILING'))
-                    db.execute('INSERT INTO requirements VALUES(?,?,?)', (cur.lastrowid,line['material_id'],required))
-            elif action in ('issue','advance','complete'):
-                r = self.one(db,'workorders',ident(data,'id'))
-                ref = r['number']
-                steps = json.loads(r['steps'])
-                if action == 'issue':
-                    if r['status'] != '待领料':
-                        raise BusinessError('只有待领料工单可以领料')
-                    total = 0
-                    for line in db.execute('SELECT * FROM requirements WHERE work_id=?',(r['id'],)).fetchall():
-                        total += self.consume(db,line['material_id'],line['qty'],'生产领料',ref,actor)
-                    db.execute("UPDATE workorders SET status='生产中',material_cost=? WHERE id=?", (total,r['id']))
-                elif action == 'advance':
-                    if r['status'] != '生产中' or r['step'] >= len(steps):
-                        raise BusinessError('工单当前不能报工')
-                    db.execute('UPDATE workorders SET step=step+1 WHERE id=?',(r['id'],))
-                    ref += ' / ' + steps[r['step']]
+            elif action == 'finished_receive':
+                pid=ident(data,'product_id')
+                if self.one(db,'materials',pid)['kind']!='成品':
+                    raise BusinessError('请选择自产成品')
+                quantity=scaled(data.get('qty'),positive=True)
+                processing=scaled(data.get('processing_cost',0),100)
+                batch=text(data,'batch')
+                day=due_date(data,'received_on')
+                legacy_id=ident(data,'legacy_work_id') if data.get('legacy_work_id') else None
+                pending=db.execute("SELECT w.* FROM workorders w LEFT JOIN finished_receipts f ON f.legacy_work_id=w.id WHERE w.product_id=? AND f.id IS NULL AND w.status!='已完工' AND (w.status='生产中' OR EXISTS(SELECT 1 FROM movements m WHERE m.reference=w.number AND m.kind='生产领料'))",(pid,)).fetchall()
+                ref=self.number('FG')
+                if legacy_id:
+                    legacy=next((w for w in pending if w['id']==legacy_id),None)
+                    if not legacy or legacy['qty']!=quantity:
+                        raise BusinessError('历史已扣料记录与本次成品、数量不匹配，或已办理入库')
+                    material_cost=legacy['material_cost']
+                    if not material_cost:
+                        material_cost=-db.execute("SELECT COALESCE(SUM(amount),0) FROM movements WHERE reference=? AND kind='生产领料'",(legacy['number'],)).fetchone()[0]
                 else:
-                    if r['status'] != '生产中' or r['step'] != len(steps):
-                        raise BusinessError('请先完成所有工序和检验，再完工入库')
-                    processing = scaled(data.get('processing_cost',0),100)
-                    price = int((Decimal(r['material_cost']+processing)*1000/r['qty']).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
-                    self.add_lot(db,r['product_id'],text(data,'batch'),r['qty'],price,'完工入库',ref,actor)
-                    db.execute("UPDATE workorders SET status='已完工',processing_cost=? WHERE id=?", (processing,r['id']))
+                    if pending:
+                        raise BusinessError('该成品有历史已扣料记录，请先选择历史记录办理入库，避免重复扣料')
+                    lines=db.execute('SELECT * FROM bom WHERE product_id=?',(pid,)).fetchall()
+                    if not lines:
+                        raise BusinessError('请先维护该成品的物料用量表')
+                    material_cost=0
+                    for line in lines:
+                        required=int((Decimal(quantity)*line['qty']/1000).to_integral_value(rounding=ROUND_CEILING))
+                        material_cost+=self.consume(db,line['material_id'],required,'成品用料',ref,actor)
+                unit_cost=int((Decimal(material_cost+processing)*1000/quantity).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
+                self.add_lot(db,pid,batch,quantity,unit_cost,'成品入库',ref,actor)
+                db.execute('INSERT INTO finished_receipts(number,product_id,qty,batch,received_on,material_cost,processing_cost,legacy_work_id,actor,created,note) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                           (ref,pid,quantity,batch,day,material_cost,processing,legacy_id,actor,now(),str(data.get('note',''))[:160]))
+            elif action == 'statement_create':
+                partner_id=ident(data,'partner_id')
+                if self.one(db,'partners',partner_id)['kind']!='客户':
+                    raise BusinessError('请选择客户')
+                start,end=due_date(data,'from_date'),due_date(data,'to_date')
+                if start>end:
+                    raise BusinessError('起始日期不能晚于结束日期')
+                lines=db.execute("SELECT h.id,o.product_id,o.qty,o.price FROM shipments h JOIN sales o ON o.id=h.sale_id LEFT JOIN statement_lines l ON l.shipment_id=h.id WHERE o.partner_id=? AND h.shipped_on>=? AND h.shipped_on<=? AND l.id IS NULL ORDER BY h.shipped_on,h.id",(partner_id,start,end)).fetchall()
+                if not lines:
+                    raise BusinessError('此客户和日期范围内没有尚未生成对账单的发货记录')
+                total=sum(cost(line['qty'],line['price']) for line in lines)
+                ref=self.number('ST')
+                key=db.execute('INSERT INTO statements(number,partner_id,from_date,to_date,amount,actor,created) VALUES(?,?,?,?,?,?,?)',
+                               (ref,partner_id,start,end,total,actor,now())).lastrowid
+                for line in lines:
+                    db.execute('INSERT INTO statement_lines(statement_id,shipment_id,product_id,qty,price,amount) VALUES(?,?,?,?,?,?)',
+                               (key,line['id'],line['product_id'],line['qty'],line['price'],cost(line['qty'],line['price'])))
+            elif action == 'statement_confirm':
+                record=self.one(db,'statements',ident(data,'id'))
+                if record['status']!='待确认':
+                    raise BusinessError('此对账单已确认')
+                db.execute("UPDATE statements SET status='已确认',confirmed_on=? WHERE id=?",(datetime.now(BUSINESS_TZ).date().isoformat(),record['id']))
+                ref=record['number']
             elif action == 'ship':
                 r = self.one(db,'sales',ident(data,'id'))
                 if r['status'] != '待发货':

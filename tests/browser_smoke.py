@@ -33,12 +33,13 @@ def run(mobile=False):
                 page.get_by_role('button',name='进入工作台').click()
                 page.locator('#shell:not(.hidden)').wait_for()
                 page.screenshot(path='/tmp/erp-dashboard.png',full_page=True)
-                for route in ['sales','shipments','invoices','production','purchases','receipts','inventory','finance','master','audit','dashboard']:
+                for route in ['sales','shipments','invoices','preparation','statements','purchases','receipts','inventory','finance','master','audit','dashboard']:
                     page.locator(f'#nav a[href="#{route}"]').click()
+                    expect(page.locator('#nav a.active')).to_have_attribute('href','#'+route)
                     page.locator('#page h1').wait_for()
                     if mobile:
                         assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'),route
-                        assert page.locator('#page tbody td[data-label], #page td.empty').count() or route=='production'
+                        assert page.locator('#page tbody td[data-label], #page td.empty').count() or route=='preparation'
                 def open_action(action):
                     page.locator(f'#page .primary[data-action="{action}"]').click()
                 def fill(key,value):
@@ -51,20 +52,21 @@ def run(mobile=False):
                     expect(page.locator('#modal-submit')).to_be_enabled()
                 def route(name):
                     page.locator(f'#nav a[href="#{name}"]').click()
-                # A full manufacturing cycle through the actual UI.
+                    expect(page.locator('#nav a.active')).to_have_attribute('href','#'+name)
+                # Only preparation and a single finished-goods receipt, no workorders.
                 route('sales');open_action('sale')
                 select('partner_id',1);select('product_id',3);fill('qty','10');fill('price','48');save()
                 sale_number=page.locator('#page tbody tr').first.locator('.mono').inner_text()
-                page.locator('#page tbody tr').first.get_by_role('button',name='安排生产').click();save()
-                route('production')
-                page.get_by_role('button',name='按 BOM 领料').first.click();save()
-                for step in ['模切','缝纫','背胶','检验']:
-                    page.get_by_role('button',name='完成 '+step,exact=True).click();save()
-                page.get_by_role('button',name='完工入库',exact=True).click()
-                fill('batch','UI-FG-001');fill('processing_cost','30');save()
+                assert page.get_by_role('button',name='安排生产').count()==0
+                assert page.locator('#nav a[href="#production"]').count()==0
+                route('preparation')
+                assert '原料 / 商品缺口汇总' in page.locator('#page').inner_text()
+                open_action('finished_receive')
+                select('product_id',3);fill('qty','10');fill('batch','UI-FG-001');fill('processing_cost','30');fill('received_on','2026-10-31');save()
+                assert 'UI-FG-001' in page.locator('#page').inner_text()
                 route('sales')
                 row=page.locator('#page tbody tr').filter(has_text=sale_number)
-                row.get_by_role('button',name='确认发货').click();save()
+                row.get_by_role('button',name='确认发货').click();fill('shipped_on','2026-10-31');save()
                 assert '已发货' in row.inner_text()
                 if mobile:
                     bounds=row.bounding_box()
@@ -94,11 +96,19 @@ def run(mobile=False):
                     target.get_by_role('button',name='照片 (1)',exact=True).click()
                     assert page.locator('.photo-gallery img').evaluate('(img) => img.decode().then(() => img.naturalWidth)') > 0
                     page.locator('#modal-close').click()
-                route('invoices');open_action('invoice')
-                fill('number','INV-BROWSER-001');select('partner_id',1)
-                key=page.locator('#modal [name=shipment_ids] option').filter(has_text='密封条').get_attribute('value')
-                select('shipment_ids',key)
-                fill('issued_on','2026-11-01');fill('planned_on','2026-12-10');fill('amount','544');fill('tax','44');save()
+                route('statements');open_action('statement_create')
+                select('partner_id',1);fill('from_date','2026-11-01');fill('to_date','2026-11-30');save()
+                page.get_by_role('button',name='明细 / 打印',exact=True).click()
+                assert '544.00' in page.locator('#modal').inner_text()
+                assert page.get_by_role('button',name='打印 / 另存 PDF').is_visible()
+                page.locator('#modal-close').click()
+                page.get_by_role('button',name='确认对账',exact=True).click();save()
+                assert '已确认' in page.locator('#page').inner_text()
+                page.get_by_role('button',name='登记发票',exact=True).click()
+                assert page.locator('#modal [name=amount]').input_value()=='544'
+                assert '密封条' in page.locator('#modal [name=part_name]').input_value()
+                fill('number','INV-BROWSER-001');fill('issued_on','2026-11-01');fill('planned_on','2026-12-10');fill('tax','44');save()
+                route('invoices')
                 assert 'INV-BROWSER-001' in page.locator('#page').inner_text()
                 assert '500.00' in page.locator('#page').inner_text()
                 assert '未收款' in page.locator('#page tbody').inner_text()
@@ -142,6 +152,9 @@ def run(mobile=False):
                     assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
                     assert db.execute('SELECT COUNT(*) FROM invoices').fetchone()[0]==3
                     assert db.execute('SELECT COUNT(*) FROM shipments').fetchone()[0]==2
+                    assert db.execute('SELECT COUNT(*) FROM finished_receipts').fetchone()[0]==1
+                    assert db.execute('SELECT COUNT(*) FROM workorders').fetchone()[0]==0
+                    assert db.execute('SELECT COUNT(*) FROM statements').fetchone()[0]==1
                     assert db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]==0
                     assert db.execute('SELECT COUNT(*) FROM attachments').fetchone()[0]==2
                     assert db.execute('SELECT data FROM attachments LIMIT 1').fetchone()[0]==photo.read_bytes()
@@ -149,7 +162,7 @@ def run(mobile=False):
                 assert '504.00' in page.locator('#page').inner_text()
                 route('inventory');page.get_by_role('button',name='批次追溯',exact=True).click()
                 page.locator('#page tbody tr').filter(has_text='UI-FG-001').get_by_role('button',name='追溯').click()
-                assert '生产领料' in page.locator('#modal').inner_text()
+                assert '成品用料' in page.locator('#modal').inner_text()
                 page.locator('#modal-close').click()
                 # XSS stays text after rendering a user-supplied material name.
                 route('master');open_action('material')
@@ -163,7 +176,7 @@ def run(mobile=False):
                 page.locator('#login:not(.hidden)').wait_for()
                 assert errors==[],errors
                 browser.close()
-                print(('Mobile' if mobile else 'Desktop')+' Browser PASS: all pages, manufacturing, trade, payment, trace, escaped content, mobile layout; no JS errors.')
+                print(('Mobile' if mobile else 'Desktop')+' Browser PASS: all pages, preparation, finished receipt, monthly statement, invoicing, photos, backup, trace; no JS errors.')
         finally:
             server.shutdown();server.server_close();thread.join()
 

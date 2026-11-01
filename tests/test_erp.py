@@ -34,32 +34,22 @@ class WorkflowTests(unittest.TestCase):
     def stock(self, mid):
         return sum(l['qty'] for l in self.state()['lots'] if l['material_id']==mid)
 
-    def work(self, qty='10', **extra):
-        self.act('work',product_id=3,qty=qty,due='2026-12-01',**extra)
-        return self.state()['workorders'][0]['id']
-
-    def test_manufacturing_to_sale_and_payment(self):
+    def test_finished_receipt_to_sale_and_payment_without_workorder(self):
         self.act('sale',product_id=3,partner_id=1,qty='100',price='48',due='2026-12-01')
         sale=self.state()['sales'][0]
-        wid=self.work('100',sale_id=sale['id'])
         before=self.stock(1)
-        self.act('issue',id=wid)
+        self.act('finished_receive',product_id=3,qty='100',batch='FG-NEW',processing_cost='200',received_on='2026-11-01')
         self.assertEqual(self.stock(1),before-125000)
-        with self.assertRaises(BusinessError):
-            self.act('complete',id=wid,batch='FG-NEW',processing_cost='200')
-        for _ in range(4):
-            self.act('advance',id=wid)
-        self.act('complete',id=wid,batch='FG-NEW',processing_cost='200')
-        w=self.state()['workorders'][0]
-        self.assertEqual(w['status'],'已完工')
-        self.assertEqual(w['material_cost'],365000)
-        self.assertEqual(w['processing_cost'],20000)
+        entry=self.state()['finished_receipts'][0]
+        self.assertEqual(entry['material_cost'],365000)
+        self.assertEqual(entry['processing_cost'],20000)
+        self.assertEqual(self.stock(3),180000)
+        with self.erp.connection() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM workorders').fetchone()[0],0)
         self.act('ship',id=sale['id'])
         self.assertEqual(self.stock(3),80000)
         self.act('payment',kind='收款',reference=sale['number'],amount='4800')
         self.assertEqual(self.state()['payments'][0]['amount'],480000)
-        with self.assertRaises(BusinessError):
-            self.act('payment',kind='收款',reference=sale['number'],amount='0.01')
         with self.assertRaises(BusinessError):
             self.act('ship',id=sale['id'])
 
@@ -78,23 +68,24 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(BusinessError):
             self.act('work',product_id=5,qty='1',due='2026-12-01')
 
-    def test_insufficient_material_rolls_back_all_stock(self):
-        # Steel/fabric is sufficient; second material is not. First deduction must roll back.
+    def test_insufficient_material_rolls_back_finished_receipt(self):
         self.act('bom',product_id=3,material_id=2,qty='1000')
-        wid=self.work('10')
-        stock_before=self.stock(1)
-        moves_before=len(self.state()['movements'])
+        before=self.state()
         with self.assertRaises(BusinessError):
-            self.act('issue',id=wid)
-        self.assertEqual(self.stock(1),stock_before)
-        self.assertEqual(len(self.state()['movements']),moves_before)
-        self.assertEqual(self.state()['workorders'][0]['status'],'待领料')
+            self.act('finished_receive',product_id=3,qty='10',batch='FAIL',received_on='2026-11-01')
+        self.assertEqual(self.state()['lots'],before['lots'])
+        self.assertEqual(self.state()['movements'],before['movements'])
+        self.assertEqual(self.state()['finished_receipts'],[])
 
-    def test_bom_frozen_at_work_creation(self):
-        wid=self.work()
+    def test_recipe_changes_affect_future_receipts_only(self):
+        self.act('finished_receive',product_id=3,qty='10',batch='RECIPE-1',received_on='2026-11-01')
+        first=self.state()['finished_receipts'][0]
         self.act('bom',product_id=3,material_id=1,qty='9')
-        req=[r for r in self.state()['requirements'] if r['work_id']==wid and r['material_id']==1][0]
-        self.assertEqual(req['qty'],12500)
+        self.act('finished_receive',product_id=3,qty='10',batch='RECIPE-2',received_on='2026-11-02')
+        moves=self.state()['movements']
+        self.assertEqual([m['qty'] for m in moves if m['reference']==first['number'] and m['material_id']==1],[-12500])
+        second=self.state()['finished_receipts'][0]
+        self.assertEqual([m['qty'] for m in moves if m['reference']==second['number'] and m['material_id']==1],[-90000])
 
     def test_duplicate_receipt_and_batch_rejected(self):
         self.act('purchase',material_id=5,partner_id=3,qty='10',price='20')
@@ -134,15 +125,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNone(self.erp.user(token))
         self.assertTrue(self.erp.login('admin','changed-password-1234'))
 
-    def test_decimal_validation_and_order_planning(self):
+    def test_decimal_validation(self):
         for n in ['NaN','Infinity','-1','0','0.0001']:
             with self.assertRaises(BusinessError):
                 scaled(n,positive=True)
         self.assertEqual(scaled('1.125'),1125)
-        sale=self.state()['sales'][0]
-        with self.assertRaises(BusinessError):
-            self.act('work',product_id=sale['product_id'],sale_id=sale['id'],qty='10000',due='2026-12-01')
-        self.assertFalse(self.state()['workorders'])
 
     def test_empty_database_and_restart_preserves_data(self):
         with tempfile.TemporaryDirectory() as d:
@@ -369,6 +356,77 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(state['payments']),1)
         self.assertIsNone(state['payments'][0]['invoice_id'])
         self.assertEqual(len(list(Path(self.temp.name,'backups').glob('pre-upgrade-*.sqlite3'))),1)
+
+
+    def test_removed_production_actions_cannot_change_data(self):
+        before=self.state()
+        for action in ('work','issue','advance','complete'):
+            with self.assertRaises(BusinessError):
+                self.act(action,id=1,product_id=3,qty='10',due='2026-12-01')
+        self.assertEqual(before['lots'],self.state()['lots'])
+        self.assertNotIn('workorders',self.state())
+        self.assertNotIn('requirements',self.state())
+
+    def test_legacy_issued_materials_not_deducted_twice(self):
+        with self.erp.connection() as db:
+            key=db.execute("INSERT INTO workorders(number,product_id,qty,due,steps,status,created) VALUES('OLD-MO',3,10000,'2026-12-01','[\"加工\"]','生产中','2026-11-01')").lastrowid
+            total=self.erp.consume(db,1,12500,'生产领料','OLD-MO','旧系统')+self.erp.consume(db,2,40000,'生产领料','OLD-MO','旧系统')
+            db.execute('UPDATE workorders SET material_cost=? WHERE id=?',(total,key))
+        raw_before=(self.stock(1),self.stock(2))
+        self.assertEqual(self.state()['legacy_materials'][0]['id'],key)
+        with self.assertRaises(BusinessError):
+            self.act('finished_receive',product_id=3,qty='10',batch='LEGACY',received_on='2026-11-02')
+        self.act('finished_receive',product_id=3,qty='10',batch='LEGACY',received_on='2026-11-02',legacy_work_id=key)
+        self.assertEqual((self.stock(1),self.stock(2)),raw_before)
+        self.assertEqual(self.state()['legacy_materials'],[])
+        self.assertEqual(self.state()['finished_receipts'][0]['material_cost'],total)
+        with self.assertRaises(BusinessError):
+            self.act('finished_receive',product_id=3,qty='10',batch='LEGACY-AGAIN',received_on='2026-11-02',legacy_work_id=key)
+        with self.erp.connection() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM workorders WHERE id=?',(key,)).fetchone()[0],1)
+
+    def test_duplicate_finished_batch_rolls_back_materials(self):
+        self.act('finished_receive',product_id=3,qty='10',batch='UNIQUE-FG',received_on='2026-11-01')
+        before=self.state()
+        with self.assertRaises(BusinessError):
+            self.act('finished_receive',product_id=3,qty='10',batch='UNIQUE-FG',received_on='2026-11-01')
+        self.assertEqual(before['lots'],self.state()['lots'])
+        self.assertEqual(before['finished_receipts'],self.state()['finished_receipts'])
+
+    def test_statement_snapshot_confirmation_and_late_supplement(self):
+        for quantity,price,day,customer in [('10','48','2026-11-01',1),('20','50','2026-11-30',1),('5','48','2026-12-01',1),('5','48','2026-11-15',2)]:
+            self.act('sale',partner_id=customer,product_id=3,qty=quantity,price=price,due='2026-12-01')
+            self.act('ship',id=self.state()['sales'][0]['id'],shipped_on=day)
+        self.act('statement_create',partner_id=1,from_date='2026-11-01',to_date='2026-11-30')
+        statement=self.state()['statements'][0]
+        self.assertEqual(statement['amount'],148000)
+        self.assertEqual(len(self.state()['statement_lines']),2)
+        with self.assertRaises(BusinessError):
+            self.act('statement_create',partner_id=1,from_date='2026-11-01',to_date='2026-11-30')
+        self.act('statement_confirm',id=statement['id'])
+        self.assertEqual(self.state()['statements'][0]['status'],'已确认')
+        with self.assertRaises(BusinessError):
+            self.act('statement_confirm',id=statement['id'])
+        with self.erp.connection() as db:
+            db.execute('UPDATE sales SET price=1')
+        self.assertEqual(self.state()['statements'][0]['amount'],148000)
+        self.act('sale',partner_id=1,product_id=3,qty='1',price='48',due='2026-12-01')
+        self.act('ship',id=self.state()['sales'][0]['id'],shipped_on='2026-11-16')
+        self.act('statement_create',partner_id=1,from_date='2026-11-01',to_date='2026-11-30')
+        self.assertEqual(self.state()['statements'][0]['amount'],4800)
+
+
+    def test_preparation_counts_only_received_stock(self):
+        self.act('bom',product_id=3,material_id=1,qty='10')
+        before=next(r for r in self.state()['preparation']['materials'] if r['material_id']==1)
+        self.assertGreater(before['purchase_suggestion'],0)
+        self.act('purchase',partner_id=3,material_id=1,qty='1000',price='18')
+        after_order=next(r for r in self.state()['preparation']['materials'] if r['material_id']==1)
+        self.assertEqual(before,after_order)
+        self.act('receive',id=self.state()['purchases'][0]['id'],batch='PREP-RECEIVED')
+        after_receipt=next(r for r in self.state()['preparation']['materials'] if r['material_id']==1)
+        self.assertEqual(before['purchase_suggestion']-after_receipt['purchase_suggestion'],1000000)
+        self.assertNotIn('incoming',after_receipt)
 
 
 class MonthlyBackupTests(unittest.TestCase):
