@@ -1,0 +1,12 @@
+{
+  "id": "/",
+  "name": "序工 · 汽配经营管理",
+  "short_name": "序工 ERP",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f5f6f2",
+  "theme_color": "#126b59",
+  "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]
+}
