@@ -5,7 +5,7 @@ import tempfile
 import threading
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from server import ERP, make_server
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, expect
 
 
 def run(mobile=False):
@@ -33,7 +33,7 @@ def run(mobile=False):
                 page.get_by_role('button',name='进入工作台').click()
                 page.locator('#shell:not(.hidden)').wait_for()
                 page.screenshot(path='/tmp/erp-dashboard.png',full_page=True)
-                for route in ['sales','shipments','invoices','production','purchases','inventory','finance','master','audit','dashboard']:
+                for route in ['sales','shipments','invoices','production','purchases','receipts','inventory','finance','master','audit','dashboard']:
                     page.locator(f'#nav a[href="#{route}"]').click()
                     page.locator('#page h1').wait_for()
                     if mobile:
@@ -48,6 +48,7 @@ def run(mobile=False):
                 def save():
                     page.locator('#modal-submit').click()
                     page.locator('#modal').wait_for(state='hidden')
+                    expect(page.locator('#modal-submit')).to_be_enabled()
                 def route(name):
                     page.locator(f'#nav a[href="#{name}"]').click()
                 # A full manufacturing cycle through the actual UI.
@@ -80,18 +81,58 @@ def run(mobile=False):
                 select('id',key);fill('receiver','验收收货人');fill('carrier','测试物流');fill('tracking','SHIP-TEST-001');save()
                 assert 'SHIP-TEST-001' in page.locator('#page').inner_text()
                 assert trade_number in page.locator('#page').inner_text()
+                import base64
+                photo=Path(directory)/'单据照片.png'
+                photo.write_bytes(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='))
+                for kind in ['receipts','shipments']:
+                    route(kind)
+                    target=page.locator('#page tbody tr').first if kind=='receipts' else page.locator('#page tbody tr').filter(has_text=trade_number)
+                    target.get_by_role('button',name='照片 (0)',exact=True).click()
+                    page.locator('#upload-photo').click()
+                    page.locator('#modal input[type=file]').set_input_files(photo)
+                    save()
+                    target.get_by_role('button',name='照片 (1)',exact=True).click()
+                    assert page.locator('.photo-gallery img').evaluate('(img) => img.decode().then(() => img.naturalWidth)') > 0
+                    page.locator('#modal-close').click()
                 route('invoices');open_action('invoice')
                 fill('number','INV-BROWSER-001');select('partner_id',1)
-                key=page.locator('#modal [name=order_id] option').filter(has_text=trade_number).get_attribute('value')
-                select('order_id',key);fill('tax','44');save()
+                key=page.locator('#modal [name=shipment_ids] option').filter(has_text='密封条').get_attribute('value')
+                select('shipment_ids',key)
+                fill('issued_on','2026-11-01');fill('planned_on','2026-12-10');fill('amount','544');fill('tax','44');save()
                 assert 'INV-BROWSER-001' in page.locator('#page').inner_text()
                 assert '500.00' in page.locator('#page').inner_text()
+                assert '未收款' in page.locator('#page tbody').inner_text()
+                page.get_by_role('button',name='登记收款',exact=True).click()
+                fill('amount','40');fill('paid_on','2026-11-02');save()
+                assert '部分收款' in page.locator('#page tbody').inner_text()
+                page.get_by_role('button',name='登记收款',exact=True).click()
+                fill('amount','504');fill('paid_on','2026-11-03');save()
+                assert '已收款' in page.locator('#page tbody').inner_text()
+                page.get_by_role('button',name='收付款明细',exact=True).click()
+                assert '2026-11-02' in page.locator('#modal').inner_text()
+                assert '504.00' in page.locator('#modal').inner_text()
+                page.locator('#modal-close').click()
+                open_action('invoice');select('kind','采购发票');select('partner_id',3)
+                fill('number','BUY-BROWSER-001');fill('part_name','背胶');fill('amount','100');fill('tax','0');fill('issued_on','2026-11-02');save()
+                page.get_by_role('button',name='登记付款',exact=True).click();fill('amount','100');save()
+                assert '已付款' in page.locator('#page tbody').inner_text()
+                # Inclusive date range and part filter are combined.
+                page.locator('#record-filter-form [name=from]').fill('2026-11-01')
+                page.locator('#record-filter-form [name=to]').fill('2026-11-01')
+                page.locator('#record-filter-form [name=part]').fill('密封')
+                page.get_by_role('button',name='筛选',exact=True).click()
+                assert 'INV-BROWSER-001' in page.locator('#page tbody').inner_text()
+                assert 'BUY-BROWSER-001' not in page.locator('#page tbody').inner_text()
+                page.locator('#record-filter-form [name=from]').fill('2026-11-10')
+                page.get_by_role('button',name='筛选',exact=True).click()
+                assert '起始日期不能晚于结束日期' in page.locator('#filter-error').inner_text()
+                page.get_by_role('button',name='重置',exact=True).click()
+                assert '本月备份已保存' in page.locator('#page').inner_text()
                 page.screenshot(path='/tmp/erp-invoices.png',full_page=True)
+                # An unpaid record can be voided; settled invoices retain their history.
+                open_action('invoice');select('partner_id',1);fill('number','VOID-001');fill('part_name','隔音垫');fill('amount','10');save()
                 page.get_by_role('button',name='作废记录',exact=True).click();save()
                 assert '作废' in page.locator('#page tbody').inner_text()
-                open_action('invoice');select('kind','采购发票');select('partner_id',3)
-                fill('number','BUY-BROWSER-001');fill('amount','100');fill('tax','0');save()
-                assert '独立登记' in page.locator('#page tbody').inner_text()
                 with page.expect_download() as event:
                     page.locator('#backup').click()
                 downloaded=Path(directory)/'browser-backup.sqlite3'
@@ -99,13 +140,13 @@ def run(mobile=False):
                 import sqlite3
                 with sqlite3.connect(downloaded) as db:
                     assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
-                    assert db.execute('SELECT COUNT(*) FROM invoices').fetchone()[0]==2
+                    assert db.execute('SELECT COUNT(*) FROM invoices').fetchone()[0]==3
                     assert db.execute('SELECT COUNT(*) FROM shipments').fetchone()[0]==2
                     assert db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]==0
-                route('finance');open_action('payment')
-                select('reference',trade_number);fill('amount','544');fill('note','浏览器验收');save()
-                page.get_by_role('button',name='收付款流水',exact=True).click()
-                assert '544.00' in page.locator('#page').inner_text()
+                    assert db.execute('SELECT COUNT(*) FROM attachments').fetchone()[0]==2
+                    assert db.execute('SELECT data FROM attachments LIMIT 1').fetchone()[0]==photo.read_bytes()
+                route('finance');page.get_by_role('button',name='收付款流水',exact=True).click()
+                assert '504.00' in page.locator('#page').inner_text()
                 route('inventory');page.get_by_role('button',name='批次追溯',exact=True).click()
                 page.locator('#page tbody tr').filter(has_text='UI-FG-001').get_by_role('button',name='追溯').click()
                 assert '生产领料' in page.locator('#modal').inner_text()

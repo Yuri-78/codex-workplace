@@ -23,6 +23,9 @@ class WorkflowTests(unittest.TestCase):
         self.temp.cleanup()
 
     def act(self, action, **data):
+        if action=='invoice':
+            data.setdefault('planned_on','2026-12-01')
+            data.setdefault('part_name','测试零件')
         return self.erp.action(self.admin,action,data)
 
     def state(self):
@@ -275,6 +278,149 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(upgraded.state(self.admin)['shipments']),1)
 
 
+    def test_invoice_links_multiple_shipments_not_orders(self):
+        keys=[]
+        for _ in range(2):
+            self.act('sale',partner_id=1,product_id=3,qty='10',price='48',due='2026-12-01')
+            self.act('ship',id=self.state()['sales'][0]['id'])
+            keys.append(self.state()['shipments'][0]['id'])
+        self.act('invoice',number='SHIP-INV',kind='销售发票',partner_id=1,shipment_ids=keys,part_name='',issued_on='2026-11-01',amount='960',tax='60',planned_on='2026-12-15')
+        row=self.state()['invoices'][0]
+        self.assertIsNone(row['sale_id'])
+        self.assertEqual(row['planned_on'],'2026-12-15')
+        self.assertIn('汽车内饰',row['part_name'])
+        self.assertEqual(len(self.state()['invoice_shipments']),2)
+        with self.assertRaises(BusinessError):
+            self.act('invoice',number='BAD-PARTNER',kind='销售发票',partner_id=2,shipment_ids=keys,issued_on='2026-11-01',amount='10')
+        with self.assertRaises(BusinessError):
+            self.act('invoice',number='BAD-KIND',kind='采购发票',partner_id=3,shipment_ids=keys,issued_on='2026-11-01',amount='10')
+
+    def test_invoice_partial_settlement_and_status_totals(self):
+        self.act('invoice',number='PARTIAL',kind='销售发票',partner_id=1,issued_on='2026-11-01',amount='100',tax='0')
+        key=self.state()['invoices'][0]['id']
+        self.act('invoice_payment',id=key,amount='40',paid_on='2026-11-05')
+        self.assertEqual(self.state()['invoices'][0]['settled_amount'],4000)
+        self.act('invoice_payment',id=key,amount='60',paid_on='2026-11-06')
+        row=self.state()['invoices'][0]
+        self.assertEqual(row['settled_amount'],10000)
+        self.assertEqual(row['last_paid_on'],'2026-11-06')
+        self.assertEqual({p['kind'] for p in self.state()['payments']},{'收款'})
+        with self.assertRaises(BusinessError):
+            self.act('invoice_payment',id=key,amount='0.01',paid_on='2026-11-07')
+        with self.assertRaises(BusinessError):
+            self.act('void_invoice',id=key)
+        self.assertEqual(len(self.state()['payments']),2)
+
+    def test_existing_payment_assignment_does_not_duplicate_cash(self):
+        sale=self.state()['sales'][0]
+        self.act('payment',kind='收款',reference=sale['number'],amount='30',paid_on='2026-11-02')
+        old=self.state()['payments'][0]
+        self.act('invoice',number='LEGACY-LINK',kind='销售发票',partner_id=sale['partner_id'],order_id=sale['id'],amount='100',tax='0',issued_on='2026-11-01')
+        key=self.state()['invoices'][0]['id']
+        self.act('invoice_payment',id=key,existing_payment_id=old['id'],paid_on='2026-11-03')
+        self.assertEqual(len(self.state()['payments']),1)
+        self.assertEqual(self.state()['invoices'][0]['settled_amount'],3000)
+        self.assertEqual(self.state()['payments'][0]['paid_on'],'2026-11-02')
+        with self.assertRaises(BusinessError):
+            self.act('invoice_payment',id=key,existing_payment_id=old['id'],paid_on='2026-11-03')
+
+    def test_received_invoice_payment_and_required_fields(self):
+        self.act('invoice',number='RECEIVED',kind='采购发票',partner_id=3,issued_on='2026-11-01',amount='80',tax='0')
+        key=self.state()['invoices'][0]['id']
+        self.act('invoice_payment',id=key,amount='80',paid_on='2026-11-08')
+        self.assertEqual(self.state()['payments'][0]['kind'],'付款')
+        with self.assertRaises(BusinessError):
+            self.erp.action(self.admin,'invoice',dict(number='NO-PLAN',kind='销售发票',partner_id=1,issued_on='2026-11-01',amount='10',part_name='零件'))
+        self.act('invoice_details',id=key,planned_on='2026-12-20',part_name='新零件名称')
+        self.assertEqual(self.state()['invoices'][0]['planned_on'],'2026-12-20')
+
+    def test_receipt_and_photo_survive_standalone_backup(self):
+        import base64
+        from backup import backup
+        photo=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=')
+        self.act('purchase',partner_id=3,material_id=1,qty='1',price='18')
+        self.act('receive',id=self.state()['purchases'][0]['id'],batch='PHOTO-RECEIPT')
+        receipt=self.state()['receipts'][0]
+        self.act('attachment',record_kind='receipts',record_id=receipt['id'],filename='收货单.png',content=base64.b64encode(photo).decode())
+        self.assertEqual(len(self.state()['attachments']),1)
+        self.assertNotIn('data',self.state()['attachments'][0])
+        target=Path(self.temp.name)/'with-photo.sqlite3'
+        backup(self.erp.dbpath,target)
+        with sqlite3.connect(target) as db:
+            self.assertEqual(db.execute('SELECT data FROM attachments').fetchone()[0],photo)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM receipts').fetchone()[0],1)
+        with self.assertRaises(BusinessError):
+            self.act('attachment',record_kind='receipts',record_id=receipt['id'],filename='evil.svg',content=base64.b64encode(b'<svg onload="alert(1)"></svg>').decode())
+        with self.assertRaises(BusinessError):
+            self.act('attachment',record_kind='receipts',record_id=999,filename='wrong.png',content=base64.b64encode(photo).decode())
+
+    def test_v1_upgrade_preserves_invoice_and_legacy_payments(self):
+        sale=self.state()['sales'][0]
+        self.act('invoice',number='V1',kind='销售发票',partner_id=sale['partner_id'],order_id=sale['id'],issued_on='2026-11-01',amount='100',tax='0')
+        self.act('payment',kind='收款',reference=sale['number'],amount='20')
+        with self.erp.connection() as db:
+            db.executescript("DROP TABLE attachments; DROP TABLE invoice_shipments; DROP TABLE receipts; DROP INDEX payments_invoice; ALTER TABLE invoices DROP COLUMN planned_on; ALTER TABLE invoices DROP COLUMN part_name; ALTER TABLE payments DROP COLUMN invoice_id; ALTER TABLE payments DROP COLUMN paid_on; PRAGMA user_version=1;")
+        upgraded=ERP(self.temp.name)
+        state=upgraded.state(self.admin)
+        self.assertEqual(state['invoices'][0]['number'],'V1')
+        self.assertEqual(state['invoices'][0]['planned_on'],'')
+        self.assertEqual(state['invoices'][0]['part_name'],next(m['name'] for m in state['materials'] if m['id']==sale['product_id']))
+        self.assertEqual(state['invoices'][0]['settled_amount'],0)
+        self.assertEqual(len(state['payments']),1)
+        self.assertIsNone(state['payments'][0]['invoice_id'])
+        self.assertEqual(len(list(Path(self.temp.name,'backups').glob('pre-upgrade-*.sqlite3'))),1)
+
+
+class MonthlyBackupTests(unittest.TestCase):
+    def test_rollover_catchup_no_overwrite_and_photos(self):
+        from datetime import datetime, timezone
+        from backup import MonthlyBackup
+        with tempfile.TemporaryDirectory() as d:
+            erp=ERP(Path(d)/'book',True)
+            manager=MonthlyBackup(erp.dbpath,Path(d)/'copies')
+            manager.run_once(datetime(2026,10,31,15,59,tzinfo=timezone.utc))
+            octfile=Path(d,'copies','erp-2026-10.sqlite3')
+            original=octfile.read_bytes()
+            with erp.connection() as db:
+                db.execute("INSERT INTO audit(actor,action,reference,created) VALUES('测试','test','new','2026-11-01')")
+            manager.run_once(datetime(2026,10,31,15,59,tzinfo=timezone.utc))
+            self.assertEqual(octfile.read_bytes(),original)
+            manager.run_once(datetime(2026,10,31,16,0,tzinfo=timezone.utc))
+            novfile=Path(d,'copies','erp-2026-11.sqlite3')
+            with sqlite3.connect(novfile) as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM audit').fetchone()[0],1)
+                self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0],'ok')
+            manager.run_once(datetime(2027,1,5,tzinfo=timezone.utc))
+            self.assertTrue(Path(d,'copies','erp-2027-01.sqlite3').exists())
+            self.assertFalse(Path(d,'copies','erp-2026-12.sqlite3').exists())
+            self.assertEqual(len(list(Path(d,'copies').glob('*.sqlite3'))),3)
+            self.assertEqual(list(Path(d,'copies').glob('*.partial')),[])
+
+    def test_failure_is_visible_and_retry_after_fix(self):
+        from backup import MonthlyBackup
+        with tempfile.TemporaryDirectory() as d:
+            missing=Path(d)/'book'/'erp.sqlite3'
+            manager=MonthlyBackup(missing,Path(d)/'copies')
+            self.assertTrue(manager.run_once()['error'])
+            ERP(missing.parent,True)
+            self.assertEqual(manager.run_once()['error'],'')
+            self.assertTrue(manager.status()['current_exists'])
+
+
+    def test_server_schedules_backup_without_browser_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            erp=ERP(directory,True)
+            completed=threading.Event()
+            erp.monthly_backup.run_once=completed.set
+            server=make_server(erp,port=0)
+            thread=threading.Thread(target=server.serve_forever,daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(completed.wait(3),'HTTP server must schedule backups while idle')
+            finally:
+                server.shutdown();server.server_close();thread.join()
+
+
 class DesktopLauncherTests(unittest.TestCase):
     def test_demo_is_separate_and_handles_busy_port(self):
         from try_erp import prepare_demo
@@ -360,6 +506,30 @@ class HTTPTests(unittest.TestCase):
                     self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0],'ok')
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0],0)
                     self.assertIsNotNone(db.execute("SELECT name FROM sqlite_master WHERE name='invoices'").fetchone())
+
+    def test_photo_download_requires_login(self):
+        import base64
+        passwords=dict(line.split(': ',1) for line in Path(self.temp.name,'initial-accounts.txt').read_text().splitlines() if ': ' in line)
+        client=build_opener(HTTPCookieProcessor(CookieJar()))
+        def post(path,data):
+            return json.load(client.open(Request(self.url+path,data=json.dumps(data).encode(),headers={'Content-Type':'application/json'})))
+        post('/api/login',{'username':'admin','password':passwords['admin']})
+        post('/api/actions/purchase',dict(partner_id=3,material_id=1,qty='1',price='18'))
+        state=json.load(client.open(self.url+'/api/state'))
+        post('/api/actions/receive',dict(id=state['purchases'][0]['id'],batch='HTTP-PHOTO'))
+        state=json.load(client.open(self.url+'/api/state'))
+        photo=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=')
+        post('/api/actions/attachment',dict(record_kind='receipts',record_id=state['receipts'][0]['id'],filename='sample.png',content=base64.b64encode(photo).decode()))
+        state=json.load(client.open(self.url+'/api/state'))
+        key=state['attachments'][0]['id']
+        self.assertNotIn('data',state['attachments'][0])
+        response=client.open(self.url+f'/api/attachments/{key}')
+        self.assertEqual(response.headers['Content-Type'],'image/png')
+        self.assertEqual(response.headers['X-Content-Type-Options'],'nosniff')
+        self.assertEqual(response.read(),photo)
+        with self.assertRaises(HTTPError) as error:
+            build_opener().open(self.url+f'/api/attachments/{key}')
+        self.assertEqual(error.exception.code,401)
 
 if __name__=='__main__':
     unittest.main()

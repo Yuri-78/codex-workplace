@@ -1,6 +1,8 @@
 """Small manufacturer ERP. Python 3.12+, no third-party runtime dependencies."""
 from __future__ import annotations
 import argparse
+import base64
+import binascii
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -14,6 +16,7 @@ import secrets
 import sqlite3
 import threading
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
@@ -38,6 +41,10 @@ CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY,number TEXT UNIQUE NO
 CREATE INDEX IF NOT EXISTS invoices_sale ON invoices(sale_id,status);
 CREATE INDEX IF NOT EXISTS invoices_purchase ON invoices(purchase_id,status);
 CREATE INDEX IF NOT EXISTS movements_reference ON movements(reference);
+CREATE TABLE IF NOT EXISTS receipts(id INTEGER PRIMARY KEY,number TEXT UNIQUE NOT NULL,purchase_id INTEGER UNIQUE NOT NULL REFERENCES purchases(id),received_on TEXT NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL,note TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS invoice_shipments(invoice_id INTEGER NOT NULL REFERENCES invoices(id),shipment_id INTEGER NOT NULL REFERENCES shipments(id),PRIMARY KEY(invoice_id,shipment_id));
+CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY,shipment_id INTEGER REFERENCES shipments(id),receipt_id INTEGER REFERENCES receipts(id),filename TEXT NOT NULL,mime TEXT NOT NULL,size INTEGER NOT NULL CHECK(size>0 AND size<=8388608),data BLOB NOT NULL,actor TEXT NOT NULL,created TEXT NOT NULL,CHECK((shipment_id IS NOT NULL AND receipt_id IS NULL) OR (shipment_id IS NULL AND receipt_id IS NOT NULL)));
+
 
 '''
 
@@ -105,9 +112,9 @@ class ERP:
         with self.connection() as check:
             version = check.execute('PRAGMA user_version').fetchone()[0]
             existing = check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
-        if version > 1:
+        if version > 2:
             raise BusinessError('数据库版本高于当前程序，请勿使用旧程序打开')
-        if existing and version < 1:
+        if existing and version < 2:
             from backup import backup
             folder = self.directory / 'backups'
             folder.mkdir(exist_ok=True, mode=0o700)
@@ -129,8 +136,26 @@ class ERP:
             if demo and not db.execute('SELECT 1 FROM materials').fetchone():
                 self.seed(db)
             self.backfill_shipments(db)
-            db.execute('PRAGMA user_version=1')
+            for order in db.execute("SELECT p.* FROM purchases p LEFT JOIN receipts r ON r.purchase_id=p.id WHERE p.status='已收货' AND r.id IS NULL").fetchall():
+                stamp=db.execute("SELECT MIN(created) FROM movements WHERE reference=? AND kind='采购入库'",(order['number'],)).fetchone()[0]
+                day=datetime.fromisoformat(stamp).astimezone(BUSINESS_TZ).date().isoformat() if stamp else ''
+                db.execute('INSERT INTO receipts(number,purchase_id,received_on,actor,created,note) VALUES(?,?,?,?,?,?)',
+                           (self.number('RC'),order['id'],day,'历史导入',stamp or now(),'历史收货记录补录'))
+            invoice_columns = {row['name'] for row in db.execute('PRAGMA table_info(invoices)')}
+            for column in ('planned_on','part_name'):
+                if column not in invoice_columns:
+                    db.execute(f"ALTER TABLE invoices ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+            payment_columns = {row['name'] for row in db.execute('PRAGMA table_info(payments)')}
+            if 'invoice_id' not in payment_columns:
+                db.execute('ALTER TABLE payments ADD COLUMN invoice_id INTEGER REFERENCES invoices(id)')
+            if 'paid_on' not in payment_columns:
+                db.execute("ALTER TABLE payments ADD COLUMN paid_on TEXT NOT NULL DEFAULT ''")
+            db.execute('CREATE INDEX IF NOT EXISTS payments_invoice ON payments(invoice_id)')
+            db.execute("UPDATE invoices SET part_name=COALESCE((SELECT m.name FROM sales o JOIN materials m ON m.id=o.product_id WHERE o.id=invoices.sale_id),(SELECT m.name FROM purchases o JOIN materials m ON m.id=o.material_id WHERE o.id=invoices.purchase_id),'') WHERE part_name=''")
+            db.execute('PRAGMA user_version=2')
         os.chmod(self.dbpath, 0o600)
+        from backup import MonthlyBackup
+        self.monthly_backup = MonthlyBackup(self.dbpath, self.directory / 'backups' / 'monthly')
 
     def backfill_shipments(self, db):
         # Historical sales already deducted stock. Create documentary records only.
@@ -159,7 +184,7 @@ class ERP:
 
     @staticmethod
     def one(db, table, key):
-        allowed = {'materials','partners','sales','purchases','workorders','users','invoices'}
+        allowed = {'materials','partners','sales','purchases','workorders','users','invoices','shipments','receipts'}
         if table not in allowed:
             raise BusinessError('无效的数据表')
         r = db.execute(f'SELECT * FROM {table} WHERE id=?', (key,)).fetchone()
@@ -234,15 +259,36 @@ class ERP:
 
     def state(self, user):
         with self.connection() as db:
-            result = {t:self.rows(db,f'SELECT * FROM {t} ORDER BY id DESC') for t in ('materials','partners','sales','purchases','workorders','lots','movements','audit','payments','shipments','invoices')}
+            result = {t:self.rows(db,f'SELECT * FROM {t} ORDER BY id DESC') for t in ('materials','partners','sales','purchases','workorders','lots','movements','audit','payments','shipments','invoices','receipts')}
+            result['attachments'] = self.rows(db,'SELECT id,shipment_id,receipt_id,filename,mime,size,actor,created FROM attachments ORDER BY id DESC')
+            result['invoice_shipments'] = self.rows(db,'SELECT * FROM invoice_shipments')
             result['bom'] = self.rows(db,'SELECT * FROM bom ORDER BY product_id,material_id')
             result['requirements'] = self.rows(db,'SELECT * FROM requirements')
+            result['invoices'] = self.rows(db, 'SELECT i.*, COALESCE(SUM(p.amount),0) AS settled_amount, MAX(p.paid_on) AS last_paid_on FROM invoices i LEFT JOIN payments p ON p.invoice_id=i.id GROUP BY i.id ORDER BY i.id DESC')
+            if user['role']=='管理':
+                result['monthly_backup'] = self.monthly_backup.status()
             result['user'] = user
             result['demo'] = (self.directory / 'demo-mode').exists()
             return result
 
+    def invoice_shipments(self, db, data, partner_id, kind):
+        ids=data.get('shipment_ids',[])
+        if not isinstance(ids,list) or len(ids)>100:
+            raise BusinessError('发货单必须为列表，最多选择 100 张')
+        ids=list(dict.fromkeys(ident({'id':key},'id') for key in ids))
+        if ids and kind!='销售发票':
+            raise BusinessError('只有开出的销售发票可以关联发货单')
+        parts=[]
+        for key in ids:
+            row=db.execute('SELECT o.partner_id,m.name FROM shipments h JOIN sales o ON o.id=h.sale_id JOIN materials m ON m.id=o.product_id WHERE h.id=?',(key,)).fetchone()
+            if not row or row['partner_id']!=partner_id:
+                raise BusinessError('请选择同一客户的发货单')
+            if row['name'] not in parts:
+                parts.append(row['name'])
+        return ids,', '.join(parts)
+
     def action(self, user, action, data):
-        permissions = {'业务':{'partner','sale','purchase','payment','invoice','void_invoice'},'仓库':{'opening','receive','ship'},'生产':{'work','issue','advance','complete'}}
+        permissions = {'业务':{'partner','sale','purchase','payment','invoice','void_invoice','invoice_payment','invoice_details'},'仓库':{'opening','receive','ship','attachment'},'生产':{'work','issue','advance','complete'}}
         if action != 'password' and user['role'] != '管理' and action not in permissions.get(user['role'],set()):
             raise BusinessError('当前账号没有此操作权限')
         actor = user['name']
@@ -292,6 +338,9 @@ class ERP:
                 ref = r['number']
                 self.add_lot(db,r['material_id'],text(data,'batch'),r['qty'],r['price'],'采购入库',ref,actor)
                 db.execute("UPDATE purchases SET status='已收货' WHERE id=?", (r['id'],))
+                day=due_date(data,'received_on') if data.get('received_on') else datetime.now(BUSINESS_TZ).date().isoformat()
+                db.execute('INSERT INTO receipts(number,purchase_id,received_on,actor,created) VALUES(?,?,?,?,?)',
+                           (self.number('RC'),r['id'],day,actor,now()))
             elif action == 'work':
                 pid, qty = ident(data,'product_id'),scaled(data.get('qty'),positive=True)
                 if self.one(db,'materials',pid)['kind'] != '成品':
@@ -377,13 +426,63 @@ class ERP:
                         sale_id=order['id']
                     else:
                         purchase_id=order['id']
+                shipment_ids,shipment_parts=self.invoice_shipments(db,data,partner['id'],kind)
+                part_name = str(data.get('part_name','')).strip() or shipment_parts
+                if not part_name and order_id:
+                    part_name = self.one(db,'materials',order['product_id'] if kind=='销售发票' else order['material_id'])['name']
+                part_name = text({'part_name':part_name},'part_name')
                 ref=text(data,'number')
-                db.execute('INSERT INTO invoices(number,kind,partner_id,sale_id,purchase_id,issued_on,amount,tax,note,actor,created) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-                           (ref,kind,partner['id'],sale_id,purchase_id,due_date(data,'issued_on'),gross,tax,str(data.get('note',''))[:160],actor,now()))
+                db.execute('INSERT INTO invoices(number,kind,partner_id,sale_id,purchase_id,issued_on,amount,tax,note,actor,created,planned_on,part_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                           (ref,kind,partner['id'],sale_id,purchase_id,due_date(data,'issued_on'),gross,tax,str(data.get('note',''))[:160],actor,now(),due_date(data,'planned_on'),part_name))
+                invoice_id=db.execute('SELECT last_insert_rowid()').fetchone()[0]
+                db.executemany('INSERT INTO invoice_shipments VALUES(?,?)',[(invoice_id,key) for key in shipment_ids])
+            elif action == 'invoice_details':
+                invoice=self.one(db,'invoices',ident(data,'id'))
+                if invoice['status']!='有效':
+                    raise BusinessError('作废记录不能修改')
+                db.execute('UPDATE invoices SET planned_on=?,part_name=? WHERE id=?',
+                           (due_date(data,'planned_on'),text(data,'part_name'),invoice['id']))
+                if 'shipment_ids' in data:
+                    ids,_=self.invoice_shipments(db,data,invoice['partner_id'],invoice['kind'])
+                    db.execute('DELETE FROM invoice_shipments WHERE invoice_id=?',(invoice['id'],))
+                    db.executemany('INSERT INTO invoice_shipments VALUES(?,?)',[(invoice['id'],key) for key in ids])
+                ref=invoice['number']
+            elif action == 'invoice_payment':
+                invoice=self.one(db,'invoices',ident(data,'id'))
+                if invoice['status']!='有效':
+                    raise BusinessError('作废记录不能登记收付款')
+                settled=db.execute('SELECT COALESCE(SUM(amount),0) FROM payments WHERE invoice_id=?',(invoice['id'],)).fetchone()[0]
+                kind='收款' if invoice['kind']=='销售发票' else '付款'
+                oid=invoice['sale_id'] or invoice['purchase_id']
+                order=self.one(db,'sales' if kind=='收款' else 'purchases',oid) if oid else None
+                reference=order['number'] if order else 'INV:'+invoice['number']
+                paid_on=due_date(data,'paid_on')
+                existing=data.get('existing_payment_id')
+                if existing:
+                    payment=db.execute('SELECT * FROM payments WHERE id=?',(ident(data,'existing_payment_id'),)).fetchone()
+                    if not payment or payment['invoice_id'] is not None or payment['reference']!=reference or payment['kind']!=kind:
+                        raise BusinessError('请选择同一订单尚未关联发票的收付款记录')
+                    amount=payment['amount']
+                else:
+                    amount=scaled(data.get('amount'),100,positive=True)
+                if settled+amount > invoice['amount']:
+                    raise BusinessError('本次金额超过发票未结余额')
+                if existing:
+                    db.execute("UPDATE payments SET invoice_id=?,paid_on=CASE WHEN paid_on='' THEN ? ELSE paid_on END WHERE id=?",(invoice['id'],paid_on,payment['id']))
+                else:
+                    if order:
+                        order_paid=db.execute('SELECT COALESCE(SUM(amount),0) FROM payments WHERE reference=? AND kind=?',(reference,kind)).fetchone()[0]
+                        if order_paid+amount > cost(order['qty'],order['price']):
+                            raise BusinessError('金额超过订单未结余额；如已登记收付款，请关联已有记录，勿重复新增')
+                    db.execute('INSERT INTO payments(kind,reference,amount,note,actor,created,invoice_id,paid_on) VALUES(?,?,?,?,?,?,?,?)',
+                               (kind,reference,amount,str(data.get('note',''))[:160],actor,now(),invoice['id'],paid_on))
+                ref=invoice['number']
             elif action == 'void_invoice':
                 invoice=self.one(db,'invoices',ident(data,'id'))
                 if invoice['status']!='有效':
                     raise BusinessError('该记录已经作废')
+                if db.execute('SELECT 1 FROM payments WHERE invoice_id=?',(invoice['id'],)).fetchone():
+                    raise BusinessError('该发票已有收付款记录，当前版本不支持直接作废，请先核对结算')
                 db.execute("UPDATE invoices SET status='作废' WHERE id=?",(invoice['id'],))
                 ref=invoice['number']
             elif action == 'payment':
@@ -398,7 +497,33 @@ class ERP:
                 paid = db.execute('SELECT COALESCE(SUM(amount),0) FROM payments WHERE kind=? AND reference=?',(kind,ref)).fetchone()[0]
                 if paid+amount > cost(r['qty'],r['price']):
                     raise BusinessError('金额超过该单据未结余额')
-                db.execute('INSERT INTO payments(kind,reference,amount,note,actor,created) VALUES(?,?,?,?,?,?)', (kind,ref,amount,str(data.get('note',''))[:160],actor,now()))
+                db.execute('INSERT INTO payments(kind,reference,amount,note,actor,created,paid_on) VALUES(?,?,?,?,?,?,?)', (kind,ref,amount,str(data.get('note',''))[:160],actor,now(),due_date(data,'paid_on') if data.get('paid_on') else datetime.now(BUSINESS_TZ).date().isoformat()))
+            elif action == 'attachment':
+                record_kind=text(data,'record_kind')
+                if record_kind not in ('shipments','receipts'):
+                    raise BusinessError('照片只能关联收货单或发货单')
+                record=self.one(db,record_kind,ident(data,'record_id'))
+                column='shipment_id' if record_kind=='shipments' else 'receipt_id'
+                if db.execute(f'SELECT COUNT(*) FROM attachments WHERE {column}=?',(record['id'],)).fetchone()[0]>=10:
+                    raise BusinessError('每张单据最多保存 10 张照片')
+                try:
+                    raw=base64.b64decode(data.get('content',''),validate=True)
+                except (binascii.Error,ValueError,TypeError):
+                    raise BusinessError('照片内容格式无效')
+                if not 0<len(raw)<=8*1024*1024:
+                    raise BusinessError('每张照片最大 8 MB')
+                if raw.startswith(b'\xff\xd8\xff') and raw.endswith(b'\xff\xd9'):
+                    mime='image/jpeg'
+                elif raw.startswith(b'\x89PNG\r\n\x1a\n'):
+                    mime='image/png'
+                elif raw.startswith(b'RIFF') and raw[8:12]==b'WEBP':
+                    mime='image/webp'
+                else:
+                    raise BusinessError('请上传 JPG、PNG 或 WebP 照片，不支持 SVG、HEIC 或其他文件')
+                filename=text(data,'filename').replace('\\','/').rsplit('/',1)[-1]
+                db.execute(f'INSERT INTO attachments({column},filename,mime,size,data,actor,created) VALUES(?,?,?,?,?,?,?)',
+                           (record['id'],filename,mime,len(raw),raw,actor,now()))
+                ref=record['number']
             elif action == 'password':
                 r = self.one(db,'users',user['id'])
                 if not secrets.compare_digest(password_hash(str(data.get('old_password','')),r['salt']),r['password']):
@@ -456,6 +581,19 @@ class Handler(BaseHTTPRequestHandler):
             if not user:
                 return self.respond(401,{'error':'请先登录'})
             return self.respond(200,self.server.erp.state(user))
+        if path.startswith('/api/attachments/'):
+            user=self.server.erp.user(self.token())
+            if not user:
+                return self.respond(401,{'error':'请先登录'})
+            try:
+                key=int(path.rsplit('/',1)[-1])
+            except ValueError:
+                return self.respond(404,{'error':'照片不存在'})
+            with self.server.erp.connection() as db:
+                photo=db.execute('SELECT mime,data FROM attachments WHERE id=?',(key,)).fetchone()
+            if not photo:
+                return self.respond(404,{'error':'照片不存在'})
+            return self.respond(200,photo['data'],photo['mime'])
         assets = {
             '/': ('index.html', 'text/html; charset=utf-8'),
             '/help': ('help.html', 'text/html; charset=utf-8'),
@@ -478,9 +616,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(403,{'error':'不允许跨站操作'})
         if self.headers.get('Content-Type','').split(';')[0] != 'application/json':
             return self.respond(415,{'error':'需要 application/json'})
+        path = urlsplit(self.path).path
         try:
             length = int(self.headers.get('Content-Length','0'))
-            if length <= 0 or length > 65536:
+            if length <= 0 or length > (12*1024*1024 if path=='/api/actions/attachment' else 65536):
                 return self.respond(413,{'error':'请求大小无效'})
             data = json.loads(self.rfile.read(length))
             if not isinstance(data,dict):
@@ -531,8 +670,27 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(500,{'error':'服务器处理失败，请查看服务日志'})
 
 
+class ERPServer(ThreadingHTTPServer):
+    def __init__(self, *args, **kwargs):
+        self.next_backup_check = 0
+        self.backup_worker = None
+        super().__init__(*args, **kwargs)
+
+    def service_actions(self):
+        # Runs even without browser requests. File I/O is performed outside the HTTP loop.
+        if time.monotonic() >= self.next_backup_check and (self.backup_worker is None or not self.backup_worker.is_alive()):
+            self.next_backup_check = time.monotonic() + 60
+            self.backup_worker = threading.Thread(target=self.erp.monthly_backup.run_once, daemon=True)
+            self.backup_worker.start()
+
+    def server_close(self):
+        super().server_close()
+        if self.backup_worker is not None:
+            self.backup_worker.join()
+
+
 def make_server(erp, host='127.0.0.1', port=8000, secure_cookie=False):
-    server = ThreadingHTTPServer((host,port),Handler)
+    server = ERPServer((host,port),Handler)
     server.erp = erp
     server.secure_cookie = secure_cookie
     server.login_lock = threading.Lock()
